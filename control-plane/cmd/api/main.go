@@ -1,0 +1,142 @@
+// Command api runs the Launchpad control plane.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime/debug"
+	"syscall"
+	"time"
+
+	"github.com/KaumudiRRawal/launchpad/control-plane/internal/config"
+	"github.com/KaumudiRRawal/launchpad/control-plane/internal/httpx"
+	"github.com/KaumudiRRawal/launchpad/control-plane/internal/store"
+	"github.com/KaumudiRRawal/launchpad/control-plane/migrations"
+)
+
+func main() {
+	if err := run(); err != nil {
+		// The logger may not exist yet if config failed, so report to stderr.
+		fmt.Fprintf(os.Stderr, "launchpad: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	log := newLogger(cfg)
+	slog.SetDefault(log)
+
+	// Cancels on SIGINT/SIGTERM, which starts graceful shutdown.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log.Info("starting launchpad control plane",
+		slog.String("env", cfg.Env),
+		slog.String("addr", cfg.HTTPAddr),
+		slog.String("version", buildVersion()))
+
+	pool, err := store.Connect(ctx, cfg.DatabaseURL, log)
+	if err != nil {
+		return fmt.Errorf("connect to database: %w", err)
+	}
+	defer pool.Close()
+
+	if err := store.Migrate(ctx, pool, migrations.FS, log); err != nil {
+		return fmt.Errorf("migrate database: %w", err)
+	}
+
+	api := &httpx.API{DB: pool, Log: log, Version: buildVersion()}
+
+	srv := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           api.Routes(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		// Deliberately generous: streaming build logs hold connections open
+		// for the length of a deployment.
+		WriteTimeout: 10 * time.Minute,
+		IdleTimeout:  2 * time.Minute,
+		BaseContext:  func(net.Listener) context.Context { return ctx },
+	}
+
+	serveErr := make(chan error, 1)
+	go func() {
+		log.Info("http server listening", slog.String("addr", cfg.HTTPAddr))
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+			return
+		}
+		serveErr <- nil
+	}()
+
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			return fmt.Errorf("http server: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		log.Info("shutdown signal received, draining connections",
+			slog.Duration("timeout", cfg.ShutdownTimeout))
+	}
+
+	// ctx is already cancelled here, so the shutdown deadline needs a fresh one.
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.ShutdownTimeout)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("graceful shutdown failed: %w", err)
+	}
+
+	log.Info("shutdown complete")
+	return nil
+}
+
+func newLogger(cfg config.Config) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: cfg.LogLevel}
+
+	// JSON in production for log aggregation; human-readable text locally.
+	if cfg.IsProduction() {
+		return slog.New(slog.NewJSONHandler(os.Stdout, opts))
+	}
+	return slog.New(slog.NewTextHandler(os.Stdout, opts))
+}
+
+// buildVersion reports the VCS revision stamped in by the Go toolchain, so a
+// running instance can be traced back to a commit without a build flag.
+func buildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	var revision, modified string
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			revision = setting.Value
+		case "vcs.modified":
+			modified = setting.Value
+		}
+	}
+	if revision == "" {
+		return "dev"
+	}
+	if len(revision) > 12 {
+		revision = revision[:12]
+	}
+	if modified == "true" {
+		return revision + "-dirty"
+	}
+	return revision
+}
