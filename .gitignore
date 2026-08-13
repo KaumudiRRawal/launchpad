@@ -1,0 +1,35 @@
+# Binaries
+bin/
+*.exe
+*.test
+
+# Go
+vendor/
+coverage.out
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.tfvars
+!*.tfvars.example
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Workspace data
+/tmp/
+/data/

@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: launchpad-postgres
+    environment:
+      POSTGRES_USER: launchpad
+      POSTGRES_PASSWORD: launchpad
+      POSTGRES_DB: launchpad
+    ports:
+      - "5432:5432"
+    volumes:
+      - launchpad-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U launchpad -d launchpad"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  launchpad-pgdata:
