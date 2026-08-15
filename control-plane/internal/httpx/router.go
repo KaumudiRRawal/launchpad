@@ -16,6 +16,7 @@ type Pinger interface {
 // API wires the control-plane HTTP handlers to their dependencies.
 type API struct {
 	DB      Pinger
+	Store   Store
 	Log     *slog.Logger
 	Version string
 }
@@ -24,9 +25,39 @@ type API struct {
 func (a *API) Routes() http.Handler {
 	mux := http.NewServeMux()
 
+	// Unauthenticated. An orchestrator probing health should not need a
+	// credential, and the version is not a secret.
 	mux.HandleFunc("GET /healthz", a.handleHealth)
 	mux.HandleFunc("GET /readyz", a.handleReady)
 	mux.HandleFunc("GET /v1/version", a.handleVersion)
+
+	// Everything else under /v1 requires a bearer token. Registering these on
+	// their own mux means a new route is authenticated by default: forgetting
+	// to opt in is impossible, where forgetting to opt out would not be.
+	authed := http.NewServeMux()
+
+	authed.HandleFunc("POST /v1/projects", a.handleCreateProject)
+	authed.HandleFunc("GET /v1/projects", a.handleListProjects)
+	authed.HandleFunc("GET /v1/projects/{projectID}", a.handleGetProject)
+	authed.HandleFunc("DELETE /v1/projects/{projectID}", a.handleDeleteProject)
+
+	authed.HandleFunc("POST /v1/projects/{projectID}/services", a.handleCreateService)
+	authed.HandleFunc("GET /v1/projects/{projectID}/services", a.handleListServices)
+
+	authed.HandleFunc("POST /v1/projects/{projectID}/environments", a.handleCreateEnvironment)
+	authed.HandleFunc("GET /v1/projects/{projectID}/environments", a.handleListEnvironments)
+
+	authed.HandleFunc("GET /v1/projects/{projectID}/deployments", a.handleListDeployments)
+	authed.HandleFunc("POST /v1/deployments", a.handleCreateDeployment)
+	authed.HandleFunc("GET /v1/deployments/{deploymentID}", a.handleGetDeployment)
+
+	authed.HandleFunc("POST /v1/api-keys", a.handleCreateAPIKey)
+	authed.HandleFunc("GET /v1/api-keys", a.handleListAPIKeys)
+	authed.HandleFunc("DELETE /v1/api-keys/{keyID}", a.handleRevokeAPIKey)
+
+	// "GET /v1/version" is a more specific pattern than "/v1/", so it still
+	// wins and stays public.
+	mux.Handle("/v1/", RequireAuth(a.Store)(authed))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		Error(w, r, http.StatusNotFound, "not_found", "no route matches "+r.URL.Path)
