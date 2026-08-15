@@ -25,9 +25,16 @@ run: ## Run the control plane against the local database
 	cd $(CONTROL_PLANE) && LAUNCHPAD_DATABASE_URL="$(DATABASE_URL)" \
 		LAUNCHPAD_LOG_LEVEL=debug go run ./cmd/api
 
+.PHONY: bootstrap
+bootstrap: ## Create the first account and print its API token (EMAIL=... NAME=...)
+	@test -n "$(EMAIL)" || (echo "usage: make bootstrap EMAIL=you@example.com NAME='Your Name'" && exit 1)
+	cd $(CONTROL_PLANE) && LAUNCHPAD_DATABASE_URL="$(DATABASE_URL)" \
+		go run ./cmd/bootstrap -email "$(EMAIL)" -name "$(NAME)"
+
 .PHONY: build
-build: ## Compile the control-plane binary into bin/
+build: ## Compile the control-plane binaries into bin/
 	cd $(CONTROL_PLANE) && go build -o ../bin/launchpad-api ./cmd/api
+	cd $(CONTROL_PLANE) && go build -o ../bin/launchpad-bootstrap ./cmd/bootstrap
 
 .PHONY: test
 test: ## Run unit tests (database integration tests are skipped)

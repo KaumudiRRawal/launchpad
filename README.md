@@ -82,6 +82,64 @@ curl localhost:8080/v1/version   # build revision
 
 Run `make help` for every target.
 
+### Getting a token
+
+Minting an API key through the API requires already holding one, so the first
+credential comes from an operator command with direct database access rather
+than a public signup endpoint:
+
+```bash
+make bootstrap EMAIL=you@example.com NAME="Your Name"
+```
+
+The token is printed once and only its SHA-256 hash is stored.
+
+## API
+
+Every route under `/v1` except `/v1/version` requires
+`Authorization: Bearer <token>`.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/v1/projects` | Create a project |
+| `GET` | `/v1/projects` | List your projects |
+| `GET` | `/v1/projects/{id}` | Fetch one project |
+| `DELETE` | `/v1/projects/{id}` | Delete a project and everything under it |
+| `POST` | `/v1/projects/{id}/services` | Add a deployable unit |
+| `GET` | `/v1/projects/{id}/services` | List services |
+| `POST` | `/v1/projects/{id}/environments` | Create a preview or production environment |
+| `GET` | `/v1/projects/{id}/environments` | List environments |
+| `GET` | `/v1/projects/{id}/deployments` | Deployment history |
+| `POST` | `/v1/deployments` | Trigger a deployment |
+| `GET` | `/v1/deployments/{id}` | Deployment status |
+| `POST` | `/v1/api-keys` | Mint a key |
+| `GET` | `/v1/api-keys` | List keys, never the secrets |
+| `DELETE` | `/v1/api-keys/{id}` | Revoke a key |
+
+```bash
+curl -X POST localhost:8080/v1/projects \
+  -H "Authorization: Bearer $LAUNCHPAD_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"slug":"demo","name":"Demo App","repo_url":"https://github.com/example/demo"}'
+```
+
+Invalid input returns `422` listing every rejected field at once, so a caller
+correcting a form never has to resubmit to discover the next mistake:
+
+```json
+{
+  "error": {
+    "code": "validation_failed",
+    "message": "one or more fields are invalid",
+    "request_id": "79b72ed2f34d2cc3a785b5243b7ca506",
+    "fields": [
+      {"field": "slug", "message": "must be lowercase letters, digits and hyphens, and may not start or end with a hyphen"},
+      {"field": "name", "message": "is required"}
+    ]
+  }
+}
+```
+
 ### Tests
 
 ```bash
@@ -108,13 +166,27 @@ otherwise healthy process; it should only stop routing traffic to it.
 the development loop fast and free. The Cloud Run driver is the same contract
 against a different backend.
 
+**Ownership is enforced in SQL, not in handlers.** Every query is scoped by
+account in its `WHERE` clause, and creating a deployment joins service to
+environment through their shared project in a single statement. A handler that
+forgets an authorization check is a common way to leak data; here there is no
+check to forget, because a row belonging to someone else simply does not come
+back. Resources owned by another account return `404` rather than `403`, so a
+caller cannot confirm that an ID exists.
+
+**API keys are stored only as hashes.** A leaked database dump yields no usable
+credential. A plain SHA-256 is right here where it would be wrong for a
+password: the token is 256 bits of uniform randomness, so there is no
+dictionary to attack and nothing for a slow KDF to defend against.
+
 ## Status
 
 Built in public over seven days. Each day is a working increment.
 
 - [x] **Day 1** — Repository scaffold, Go control plane, PostgreSQL schema,
       embedded migrations, health endpoints, CI
-- [ ] **Day 2** — Domain model, REST API, authentication
+- [x] **Day 2** — Domain model, REST API, API-key authentication, ownership
+      isolation enforced in SQL
 - [ ] **Day 3** — Deploy engine: clone, build, run, stream logs
 - [ ] **Day 4** — React + TypeScript dashboard
 - [ ] **Day 5** — Preview environments, subdomain routing, typed contracts

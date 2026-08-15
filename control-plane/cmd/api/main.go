@@ -56,7 +56,12 @@ func run() error {
 		return fmt.Errorf("migrate database: %w", err)
 	}
 
-	api := &httpx.API{DB: pool, Log: log, Version: buildVersion()}
+	api := &httpx.API{
+		DB:      pool,
+		Store:   store.NewRepository(pool),
+		Log:     log,
+		Version: buildVersion(),
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
