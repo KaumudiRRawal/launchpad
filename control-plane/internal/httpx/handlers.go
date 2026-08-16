@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/domain"
 )
@@ -29,6 +30,7 @@ type Store interface {
 	CreateDeployment(ctx context.Context, accountID string, in domain.CreateDeploymentInput) (domain.Deployment, error)
 	GetDeployment(ctx context.Context, accountID, id string) (domain.Deployment, error)
 	ListDeployments(ctx context.Context, accountID, projectID string) ([]domain.Deployment, error)
+	ListDeploymentLogs(ctx context.Context, accountID, deploymentID string, afterSeq int) ([]domain.DeploymentLog, error)
 
 	CreateAPIKey(ctx context.Context, accountID, name string) (domain.APIKey, string, error)
 	ListAPIKeys(ctx context.Context, accountID string) ([]domain.APIKey, error)
@@ -281,6 +283,42 @@ func (a *API) handleListDeployments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	JSON(w, r, http.StatusOK, map[string]any{"deployments": deployments})
+}
+
+// handleDeploymentLogs returns build output. The `after` query parameter lets
+// a client poll for only what it has not seen, so following a running build
+// does not mean re-fetching the whole log each time.
+func (a *API) handleDeploymentLogs(w http.ResponseWriter, r *http.Request) {
+	account := MustAccountFrom(r.Context())
+
+	afterSeq := 0
+	if raw := r.URL.Query().Get("after"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			Error(w, r, http.StatusBadRequest, "invalid_parameter",
+				"after must be a non-negative integer")
+			return
+		}
+		afterSeq = parsed
+	}
+
+	logs, err := a.Store.ListDeploymentLogs(r.Context(), account.ID, r.PathValue("deploymentID"), afterSeq)
+	if err != nil {
+		writeStoreError(w, r, err, "deployment not found")
+		return
+	}
+
+	// next_after tells the client where to resume, so it never has to reason
+	// about sequence numbers itself.
+	nextAfter := afterSeq
+	if len(logs) > 0 {
+		nextAfter = logs[len(logs)-1].Seq
+	}
+
+	JSON(w, r, http.StatusOK, map[string]any{
+		"logs":       logs,
+		"next_after": nextAfter,
+	})
 }
 
 // --- API keys ---

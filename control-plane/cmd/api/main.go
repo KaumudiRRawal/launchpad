@@ -11,10 +11,12 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/config"
+	"github.com/KaumudiRRawal/launchpad/control-plane/internal/deploy"
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/httpx"
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/store"
 	"github.com/KaumudiRRawal/launchpad/control-plane/migrations"
@@ -56,11 +58,33 @@ func run() error {
 		return fmt.Errorf("migrate database: %w", err)
 	}
 
+	repo := store.NewRepository(pool)
+
 	api := &httpx.API{
 		DB:      pool,
-		Store:   store.NewRepository(pool),
+		Store:   repo,
 		Log:     log,
 		Version: buildVersion(),
+	}
+
+	// The deploy workers run in-process. Splitting them into a separate
+	// service would buy independent scaling that a platform this size does not
+	// need yet, at the cost of a second deployable to operate. The claim query
+	// takes a row lock, so running several workers here is already safe.
+	var workers sync.WaitGroup
+	for i := range cfg.DeployWorkers {
+		engine := &deploy.Engine{
+			Store:   repo,
+			Driver:  &deploy.DockerDriver{},
+			Fetcher: &deploy.GitFetcher{},
+			Log:     log.With(slog.Int("worker", i)),
+		}
+
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			engine.Run(ctx)
+		}()
 	}
 
 	srv := &http.Server{
@@ -103,6 +127,12 @@ func run() error {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("graceful shutdown failed: %w", err)
 	}
+
+	// The workers observe the same cancelled context; waiting lets an
+	// in-flight deployment finish recording its outcome rather than being
+	// abandoned mid-build with its status stuck at building.
+	log.Info("waiting for deploy workers to drain")
+	workers.Wait()
 
 	log.Info("shutdown complete")
 	return nil

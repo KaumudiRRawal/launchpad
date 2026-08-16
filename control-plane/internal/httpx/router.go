@@ -50,6 +50,7 @@ func (a *API) Routes() http.Handler {
 	authed.HandleFunc("GET /v1/projects/{projectID}/deployments", a.handleListDeployments)
 	authed.HandleFunc("POST /v1/deployments", a.handleCreateDeployment)
 	authed.HandleFunc("GET /v1/deployments/{deploymentID}", a.handleGetDeployment)
+	authed.HandleFunc("GET /v1/deployments/{deploymentID}/logs", a.handleDeploymentLogs)
 
 	authed.HandleFunc("POST /v1/api-keys", a.handleCreateAPIKey)
 	authed.HandleFunc("GET /v1/api-keys", a.handleListAPIKeys)

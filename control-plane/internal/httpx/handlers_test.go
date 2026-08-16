@@ -24,8 +24,9 @@ const (
 // actually depend on — ownership scoping and slug uniqueness — so the tests
 // exercise real decisions rather than a mock that always succeeds.
 type fakeStore struct {
-	projects []domain.Project
-	nextID   int
+	projects       []domain.Project
+	deploymentLogs []domain.DeploymentLog
+	nextID         int
 
 	// Overrides for cases that are awkward to reach naturally.
 	authErr   error
@@ -34,6 +35,16 @@ type fakeStore struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{nextID: 1}
+}
+
+func (f *fakeStore) ListDeploymentLogs(_ context.Context, _, _ string, afterSeq int) ([]domain.DeploymentLog, error) {
+	out := []domain.DeploymentLog{}
+	for _, l := range f.deploymentLogs {
+		if l.Seq > afterSeq {
+			out = append(out, l)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeStore) Authenticate(_ context.Context, token string) (domain.Account, error) {
@@ -454,5 +465,57 @@ func TestCreateAPIKeyReturnsPlaintextOnce(t *testing.T) {
 	rec = request(t, srv, http.MethodGet, "/v1/api-keys", testToken, nil)
 	if strings.Contains(rec.Body.String(), body.Token) {
 		t.Error("list response leaked the plaintext token")
+	}
+}
+
+func TestDeploymentLogsResumeFromAfterCursor(t *testing.T) {
+	// Following a running build means polling, so the endpoint must return
+	// only what the client has not already seen.
+	store := newFakeStore()
+	store.deploymentLogs = []domain.DeploymentLog{
+		{Seq: 1, Stream: "stdout", Message: "fetching"},
+		{Seq: 2, Stream: "stdout", Message: "building"},
+		{Seq: 3, Stream: "stdout", Message: "live"},
+	}
+	srv := newAPI(store)
+
+	var first struct {
+		Logs      []domain.DeploymentLog `json:"logs"`
+		NextAfter int                    `json:"next_after"`
+	}
+	rec := request(t, srv, http.MethodGet, "/v1/deployments/d1/logs", testToken, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body)
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&first); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(first.Logs) != 3 {
+		t.Errorf("got %d lines, want 3", len(first.Logs))
+	}
+	if first.NextAfter != 3 {
+		t.Errorf("next_after = %d, want 3", first.NextAfter)
+	}
+
+	var second struct {
+		Logs []domain.DeploymentLog `json:"logs"`
+	}
+	rec = request(t, srv, http.MethodGet, "/v1/deployments/d1/logs?after=2", testToken, nil)
+	if err := json.NewDecoder(rec.Body).Decode(&second); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(second.Logs) != 1 || second.Logs[0].Seq != 3 {
+		t.Errorf("after=2 returned %v, want only seq 3", second.Logs)
+	}
+}
+
+func TestDeploymentLogsRejectsBadCursor(t *testing.T) {
+	srv := newAPI(newFakeStore())
+
+	for _, cursor := range []string{"abc", "-1"} {
+		rec := request(t, srv, http.MethodGet, "/v1/deployments/d1/logs?after="+cursor, testToken, nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("after=%q: status = %d, want 400", cursor, rec.Code)
+		}
 	}
 }

@@ -112,6 +112,7 @@ Every route under `/v1` except `/v1/version` requires
 | `GET` | `/v1/projects/{id}/deployments` | Deployment history |
 | `POST` | `/v1/deployments` | Trigger a deployment |
 | `GET` | `/v1/deployments/{id}` | Deployment status |
+| `GET` | `/v1/deployments/{id}/logs` | Build logs, `?after=N` to resume |
 | `POST` | `/v1/api-keys` | Mint a key |
 | `GET` | `/v1/api-keys` | List keys, never the secrets |
 | `DELETE` | `/v1/api-keys/{id}` | Revoke a key |
@@ -174,6 +175,24 @@ check to forget, because a row belonging to someone else simply does not come
 back. Resources owned by another account return `404` rather than `403`, so a
 caller cannot confirm that an ID exists.
 
+**Deployments are fetched shallow, never cloned.** A full clone of a large
+repository spends minutes and bandwidth retrieving history the build will never
+read. The fetcher initialises an empty repository and pulls the single
+requested commit at depth 1.
+
+**A repository's own Dockerfile always wins.** Detection tries `Dockerfile`
+first and only then falls back to a language heuristic. If the author
+described their build, guessing instead would be both rude and wrong.
+Generated Dockerfiles are multi-stage and drop to a non-root user, because a
+platform that builds other people's code should not hand that code root.
+
+**Status transitions are enforced in the UPDATE statement.** The expected
+current status is part of the `WHERE` clause, so checking and writing are one
+atomic operation. Verifying first and updating second would leave a window in
+which another worker could change the row in between. Workers claim jobs with
+`FOR UPDATE SKIP LOCKED`, so several can run without ever building the same
+deployment twice.
+
 **API keys are stored only as hashes.** A leaked database dump yields no usable
 credential. A plain SHA-256 is right here where it would be wrong for a
 password: the token is 256 bits of uniform randomness, so there is no
@@ -187,7 +206,8 @@ Built in public over seven days. Each day is a working increment.
       embedded migrations, health endpoints, CI
 - [x] **Day 2** — Domain model, REST API, API-key authentication, ownership
       isolation enforced in SQL
-- [ ] **Day 3** — Deploy engine: clone, build, run, stream logs
+- [x] **Day 3** — Deploy engine: shallow fetch, build-strategy detection,
+      Docker driver, state machine, streamed build logs
 - [ ] **Day 4** — React + TypeScript dashboard
 - [ ] **Day 5** — Preview environments, subdomain routing, typed contracts
 - [ ] **Day 6** — Latency and reliability analysis

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,6 +17,10 @@ type Config struct {
 	DatabaseURL     string
 	LogLevel        slog.Level
 	ShutdownTimeout time.Duration
+	// DeployWorkers is how many deployments may build concurrently. Builds are
+	// CPU and I/O heavy, so this is a deliberate throttle rather than a number
+	// to raise freely.
+	DeployWorkers int
 }
 
 // Load reads configuration from LAUNCHPAD_* environment variables, applying
@@ -28,9 +33,24 @@ func Load() (Config, error) {
 		HTTPAddr:        envOr("LAUNCHPAD_HTTP_ADDR", ":8080"),
 		DatabaseURL:     os.Getenv("LAUNCHPAD_DATABASE_URL"),
 		ShutdownTimeout: 15 * time.Second,
+		DeployWorkers:   2,
 	}
 
 	var problems []string
+
+	if raw := os.Getenv("LAUNCHPAD_DEPLOY_WORKERS"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		switch {
+		case err != nil:
+			problems = append(problems, fmt.Sprintf("LAUNCHPAD_DEPLOY_WORKERS %q is not an integer", raw))
+		case parsed < 0:
+			problems = append(problems, "LAUNCHPAD_DEPLOY_WORKERS must not be negative")
+		default:
+			// Zero is legitimate: it runs the API without deploy workers, which
+			// is how a read-only replica would be configured.
+			cfg.DeployWorkers = parsed
+		}
+	}
 
 	if cfg.DatabaseURL == "" {
 		problems = append(problems, "LAUNCHPAD_DATABASE_URL is required")
