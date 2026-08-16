@@ -17,7 +17,34 @@ import (
 var (
 	ErrNotFound = errors.New("not found")
 	ErrConflict = errors.New("already exists")
+
+	// ErrInvalidTransition reports a deployment status change the lifecycle
+	// does not permit, such as reviving a failed deployment.
+	ErrInvalidTransition = errors.New("invalid status transition")
 )
+
+// DeploymentJob is everything a worker needs to build and release one
+// deployment, flattened from the rows it is spread across so the worker makes
+// one query rather than four.
+type DeploymentJob struct {
+	DeploymentID  string
+	ServiceID     string
+	EnvironmentID string
+	CommitSHA     string
+	RepoURL       string
+	SourcePath    string
+	Port          int
+	ServiceName   string
+	Subdomain     string
+}
+
+// DeploymentLog is one line of build or release output.
+type DeploymentLog struct {
+	Seq      int       `json:"seq"`
+	Stream   string    `json:"stream"`
+	Message  string    `json:"message"`
+	LoggedAt time.Time `json:"logged_at"`
+}
 
 // ValidationError reports a single rejected field. The field name is included
 // so the API can tell a caller exactly what to fix.
