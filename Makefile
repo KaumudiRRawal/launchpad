@@ -1,5 +1,6 @@
 .DEFAULT_GOAL := help
 CONTROL_PLANE := control-plane
+DASHBOARD := dashboard
 DATABASE_URL ?= postgres://launchpad:launchpad@localhost:5432/launchpad?sslmode=disable
 
 .PHONY: help
@@ -44,6 +45,25 @@ test: ## Run unit tests (database integration tests are skipped)
 test-integration: ## Run all tests including those that need a live database
 	cd $(CONTROL_PLANE) && LAUNCHPAD_TEST_DATABASE_URL="$(DATABASE_URL)" go test ./... -count=1
 
+# npm install rather than npm ci: it is a no-op when the tree is already current,
+# so it costs nothing to depend on and means no target fails with a missing
+# module on a fresh checkout.
+.PHONY: dashboard-install
+dashboard-install:
+	cd $(DASHBOARD) && npm install --no-audit --no-fund
+
+.PHONY: dashboard
+dashboard: dashboard-install ## Serve the dashboard on :5173, proxying /v1 to the control plane
+	cd $(DASHBOARD) && npm run dev
+
+.PHONY: dashboard-build
+dashboard-build: dashboard-install ## Type-check the dashboard and bundle it into dashboard/dist
+	cd $(DASHBOARD) && npm run build
+
+.PHONY: dashboard-test
+dashboard-test: dashboard-install ## Run the dashboard tests
+	cd $(DASHBOARD) && npm test
+
 .PHONY: vet
 vet: ## Run go vet
 	cd $(CONTROL_PLANE) && go vet ./...
@@ -57,4 +77,4 @@ tidy: ## Sync go.mod and go.sum
 	cd $(CONTROL_PLANE) && go mod tidy
 
 .PHONY: check
-check: fmt vet test ## Format, vet and test — run this before committing
+check: fmt vet test dashboard-test ## Format, vet and test both halves — run this before committing

@@ -66,12 +66,13 @@ previews are unbounded.
 
 ## Running locally
 
-Requires Go 1.26+ and Docker.
+Requires Go 1.26+, Docker and Node 22+.
 
 ```bash
 cp .env.example .env
 make db-up      # start PostgreSQL
 make run        # migrate on boot, then serve on :8080
+make dashboard  # in another shell: serve the UI on :5173
 ```
 
 ```bash
@@ -92,7 +93,18 @@ than a public signup endpoint:
 make bootstrap EMAIL=you@example.com NAME="Your Name"
 ```
 
-The token is printed once and only its SHA-256 hash is stored.
+The token is printed once and only its SHA-256 hash is stored. The dashboard
+asks for that token on first load; there is no login to run, and nothing to
+configure.
+
+## Dashboard
+
+`dashboard/` is a React + TypeScript single-page app. It lists and creates
+projects, adds services and environments, triggers a deployment, and follows the
+build log line by line until the deployment reaches a state it will not leave.
+
+The dev server proxies `/v1` to the control plane, so the browser talks to one
+origin and the API carries no CORS headers. See `dashboard/README.md`.
 
 ## API
 
@@ -144,8 +156,10 @@ correcting a form never has to resubmit to discover the next mistake:
 ### Tests
 
 ```bash
-make test              # unit tests, no dependencies
+make test              # Go unit tests, no dependencies
 make test-integration  # adds tests that run migrations against a live database
+make dashboard-test    # dashboard tests
+make check             # everything, before committing
 ```
 
 Integration tests skip themselves unless `LAUNCHPAD_TEST_DATABASE_URL` is set,
@@ -193,6 +207,19 @@ which another worker could change the row in between. Workers claim jobs with
 `FOR UPDATE SKIP LOCKED`, so several can run without ever building the same
 deployment twice.
 
+**Build logs are followed by polling with a cursor, not streamed.** The client
+asks for everything after the last sequence number it has seen, so a follower
+that loses its connection reconnects and misses nothing, where a broken stream
+would have to be replayed from the start. Following deliberately continues for a
+few polls after the status becomes terminal: the engine marks a deployment live
+and only then flushes its final lines, so the line naming the URL arrives *after*
+the status that says the deployment is finished.
+
+**The dashboard's wire types live in one module.** Components import their types
+from `src/api/types.ts` and reach HTTP through `src/api/client.ts` alone, so the
+hand-mirrored declarations can be swapped for generated ones without touching a
+single component.
+
 **API keys are stored only as hashes.** A leaked database dump yields no usable
 credential. A plain SHA-256 is right here where it would be wrong for a
 password: the token is 256 bits of uniform randomness, so there is no
@@ -208,7 +235,8 @@ Built in public over seven days. Each day is a working increment.
       isolation enforced in SQL
 - [x] **Day 3** — Deploy engine: shallow fetch, build-strategy detection,
       Docker driver, state machine, streamed build logs
-- [ ] **Day 4** — React + TypeScript dashboard
+- [x] **Day 4** — React + TypeScript dashboard: project and deployment
+      management, live build logs
 - [ ] **Day 5** — Preview environments, subdomain routing, typed contracts
 - [ ] **Day 6** — Latency and reliability analysis
 - [ ] **Day 7** — Terraform modules, Cloud Run driver, documentation

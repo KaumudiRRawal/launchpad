@@ -66,3 +66,30 @@ jobs:
 
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
+
+  dashboard:
+    name: Dashboard (React)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: dashboard
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - run: npm ci
+
+      # `npm run build` runs tsc first, so a type error fails here rather than
+      # reaching a browser as a runtime crash.
+      - name: Type-check and build
+        run: npm run build
+
+      - name: Test
+        run: npm test
