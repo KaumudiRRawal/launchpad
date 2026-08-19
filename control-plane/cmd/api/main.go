@@ -18,6 +18,7 @@ import (
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/config"
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/deploy"
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/httpx"
+	"github.com/KaumudiRRawal/launchpad/control-plane/internal/proxy"
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/store"
 	"github.com/KaumudiRRawal/launchpad/control-plane/migrations"
 )
@@ -61,10 +62,25 @@ func run() error {
 	repo := store.NewRepository(pool)
 
 	api := &httpx.API{
-		DB:      pool,
-		Store:   repo,
-		Log:     log,
-		Version: buildVersion(),
+		DB:         pool,
+		Store:      repo,
+		Log:        log,
+		Version:    buildVersion(),
+		BaseDomain: cfg.BaseDomain,
+		ProxyPort:  cfg.ProxyPort(),
+	}
+
+	router := &proxy.Proxy{
+		Resolver:   repo,
+		Log:        log.With(slog.String("component", "proxy")),
+		BaseDomain: cfg.BaseDomain,
+	}
+
+	proxySrv := &http.Server{
+		Addr:              cfg.ProxyAddr,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}
 
 	// The deploy workers run in-process. Splitting them into a separate
@@ -74,10 +90,13 @@ func run() error {
 	var workers sync.WaitGroup
 	for i := range cfg.DeployWorkers {
 		engine := &deploy.Engine{
-			Store:   repo,
-			Driver:  &deploy.DockerDriver{},
-			Fetcher: &deploy.GitFetcher{},
-			Log:     log.With(slog.Int("worker", i)),
+			Store:       repo,
+			Driver:      &deploy.DockerDriver{},
+			Fetcher:     &deploy.GitFetcher{},
+			Log:         log.With(slog.Int("worker", i)),
+			Invalidator: router,
+			BaseDomain:  cfg.BaseDomain,
+			ProxyPort:   cfg.ProxyPort(),
 		}
 
 		workers.Add(1)
@@ -99,7 +118,16 @@ func run() error {
 		BaseContext:  func(net.Listener) context.Context { return ctx },
 	}
 
-	serveErr := make(chan error, 1)
+	serveErr := make(chan error, 2)
+	go func() {
+		log.Info("environment proxy listening",
+			slog.String("addr", cfg.ProxyAddr),
+			slog.String("base_domain", cfg.BaseDomain))
+		if err := proxySrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- fmt.Errorf("proxy server: %w", err)
+		}
+	}()
+
 	go func() {
 		log.Info("http server listening", slog.String("addr", cfg.HTTPAddr))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -126,6 +154,9 @@ func run() error {
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("graceful shutdown failed: %w", err)
+	}
+	if err := proxySrv.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("proxy shutdown failed: %w", err)
 	}
 
 	// The workers observe the same cancelled context; waiting lets an

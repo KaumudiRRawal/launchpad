@@ -220,6 +220,20 @@ from `src/api/types.ts` and reach HTTP through `src/api/client.ts` alone, so the
 hand-mirrored declarations can be swapped for generated ones without touching a
 single component.
 
+**Environments are reached through a proxy, never directly.** Each environment
+answers on its own hostname under the platform's domain, so a preview and a
+production deployment of the same service can never be reached at one address:
+the isolation boundary is visible in the URL, not only in the database.
+
+A deployment records two addresses. The public one belongs to the environment
+and survives redeployment; the internal one is wherever the driver happened to
+put the workload and changes with every release. Separating them is what keeps
+an environment's address stable while the thing behind it is replaced.
+
+An environment that exists but has nothing serving yet answers `503` with
+`Retry-After`, not `404`. A hostname nobody has deployed to and a hostname that
+was never minted deserve different answers.
+
 **API keys are stored only as hashes.** A leaked database dump yields no usable
 credential. A plain SHA-256 is right here where it would be wrong for a
 password: the token is 256 bits of uniform randomness, so there is no
@@ -238,6 +252,7 @@ Built in public over seven days. Each day is a working increment.
 - [x] **Day 4** — React + TypeScript dashboard: project and deployment
       management, live build logs
 - [ ] **Day 5** — Preview environments, subdomain routing, typed contracts
+      *(routing and isolation done; OpenAPI-generated client still to come)*
 - [ ] **Day 6** — Latency and reliability analysis
 - [ ] **Day 7** — Terraform modules, Cloud Run driver, documentation
 

@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -21,6 +22,27 @@ type Config struct {
 	// CPU and I/O heavy, so this is a deliberate throttle rather than a number
 	// to raise freely.
 	DeployWorkers int
+	// ProxyAddr is where the environment router listens. Deployed workloads are
+	// reached through it, never directly.
+	ProxyAddr string
+	// BaseDomain is the suffix under which environment subdomains are minted.
+	// "localhost" works without any DNS setup, because every *.localhost name
+	// already resolves to the loopback address.
+	BaseDomain string
+}
+
+// ProxyPort returns the port from ProxyAddr, which the public URL of an
+// environment has to name when it is not the scheme default.
+func (c Config) ProxyPort() int {
+	_, port, err := net.SplitHostPort(c.ProxyAddr)
+	if err != nil {
+		return 0
+	}
+	parsed, err := strconv.Atoi(port)
+	if err != nil {
+		return 0
+	}
+	return parsed
 }
 
 // Load reads configuration from LAUNCHPAD_* environment variables, applying
@@ -34,6 +56,8 @@ func Load() (Config, error) {
 		DatabaseURL:     os.Getenv("LAUNCHPAD_DATABASE_URL"),
 		ShutdownTimeout: 15 * time.Second,
 		DeployWorkers:   2,
+		ProxyAddr:       envOr("LAUNCHPAD_PROXY_ADDR", ":8081"),
+		BaseDomain:      envOr("LAUNCHPAD_BASE_DOMAIN", "localhost"),
 	}
 
 	var problems []string

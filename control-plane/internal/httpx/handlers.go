@@ -229,6 +229,7 @@ func (a *API) handleCreateEnvironment(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, r, err, "project not found")
 		return
 	}
+	environment.URL = domain.PublicURL(a.BaseDomain, a.ProxyPort, environment.Subdomain)
 	JSON(w, r, http.StatusCreated, environment)
 }
 
@@ -239,6 +240,9 @@ func (a *API) handleListEnvironments(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeStoreError(w, r, err, "project not found")
 		return
+	}
+	for i := range environments {
+		environments[i].URL = domain.PublicURL(a.BaseDomain, a.ProxyPort, environments[i].Subdomain)
 	}
 	JSON(w, r, http.StatusOK, map[string]any{"environments": environments})
 }

@@ -26,6 +26,7 @@ type fakeStore struct {
 	logs        []string
 	failure     string
 	liveURL     string
+	internalURL string
 	superseded  bool
 
 	transitionErr error
@@ -55,12 +56,13 @@ func (f *fakeStore) TransitionDeployment(_ context.Context, _ string, from, to d
 	return nil
 }
 
-func (f *fakeStore) MarkDeploymentLive(_ context.Context, _, _, url string) error {
+func (f *fakeStore) MarkDeploymentLive(_ context.Context, _, _, publicURL, internalURL string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.transitions = append(f.transitions, "deploying->live")
-	f.liveURL = url
+	f.liveURL = publicURL
+	f.internalURL = internalURL
 	return nil
 }
 
@@ -160,11 +162,13 @@ func testJob() domain.DeploymentJob {
 
 func newTestEngine(store Store, fetcher Fetcher, driver Driver) *Engine {
 	return &Engine{
-		Store:   store,
-		Driver:  driver,
-		Fetcher: fetcher,
-		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		WorkDir: os.TempDir(),
+		Store:      store,
+		Driver:     driver,
+		Fetcher:    fetcher,
+		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WorkDir:    os.TempDir(),
+		BaseDomain: "localhost",
+		ProxyPort:  8081,
 	}
 }
 
@@ -192,8 +196,14 @@ func TestEngineHappyPath(t *testing.T) {
 		}
 	}
 
-	if store.liveURL != "http://localhost:32770" {
-		t.Errorf("liveURL = %q, want the driver's URL", store.liveURL)
+	// The public address is the environment's stable subdomain and survives
+	// redeployment; the driver's address changes with every release and is only
+	// ever read by the proxy.
+	if store.liveURL != "http://production-demo.localhost:8081" {
+		t.Errorf("liveURL = %q, want the environment's public address", store.liveURL)
+	}
+	if store.internalURL != "http://localhost:32770" {
+		t.Errorf("internalURL = %q, want the driver's address", store.internalURL)
 	}
 	if !store.superseded {
 		t.Error("prior deployments were not superseded")

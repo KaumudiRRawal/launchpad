@@ -19,6 +19,12 @@ type API struct {
 	Store   Store
 	Log     *slog.Logger
 	Version string
+	// BaseDomain and ProxyPort render an environment's public address. It is
+	// derived at render time rather than stored, because the platform's domain
+	// is configuration: a column would keep serving the old address after that
+	// configuration changed.
+	BaseDomain string
+	ProxyPort  int
 }
 
 // Routes returns the fully wired handler, middleware included.

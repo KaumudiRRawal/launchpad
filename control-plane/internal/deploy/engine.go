@@ -19,18 +19,31 @@ import (
 type Store interface {
 	ClaimNextDeployment(ctx context.Context) (domain.DeploymentJob, error)
 	TransitionDeployment(ctx context.Context, id string, from, to domain.DeploymentStatus) error
-	MarkDeploymentLive(ctx context.Context, id, imageRef, url string) error
+	MarkDeploymentLive(ctx context.Context, id, imageRef, publicURL, internalURL string) error
 	MarkDeploymentFailed(ctx context.Context, id, reason string) error
 	SupersedePriorDeployments(ctx context.Context, serviceID, environmentID, keepID string) error
 	AppendDeploymentLog(ctx context.Context, deploymentID string, seq int, stream, message string) error
 }
 
+// RouteInvalidator lets the engine tell the proxy that an environment's
+// upstream has moved. It is optional: a worker running without a proxy in the
+// same process simply leaves it nil.
+type RouteInvalidator interface {
+	Invalidate(subdomain string)
+}
+
 // Engine runs queued deployments to completion.
 type Engine struct {
-	Store   Store
-	Driver  Driver
-	Fetcher Fetcher
-	Log     *slog.Logger
+	Store       Store
+	Driver      Driver
+	Fetcher     Fetcher
+	Log         *slog.Logger
+	Invalidator RouteInvalidator
+
+	// BaseDomain and ProxyPort build the public address an environment answers
+	// on, which is stable across deployments.
+	BaseDomain string
+	ProxyPort  int
 
 	// WorkDir is where sources are checked out. Defaults to the system
 	// temporary directory.
@@ -191,8 +204,19 @@ func (e *Engine) deploy(ctx context.Context, job domain.DeploymentJob, logs *log
 		return fmt.Errorf("release: %w", err)
 	}
 
-	if err := e.Store.MarkDeploymentLive(ctx, job.DeploymentID, tag, result.URL); err != nil {
+	// The public address belongs to the environment and outlives this
+	// deployment; the driver's address belongs to this release alone and will
+	// differ after the next one.
+	publicURL := domain.PublicURL(e.BaseDomain, e.ProxyPort, job.Subdomain)
+
+	if err := e.Store.MarkDeploymentLive(ctx, job.DeploymentID, tag, publicURL, result.URL); err != nil {
 		return fmt.Errorf("mark live: %w", err)
+	}
+
+	// Point the proxy at the new workload straight away rather than leaving
+	// traffic on its predecessor until the route cache expires.
+	if e.Invalidator != nil {
+		e.Invalidator.Invalidate(job.Subdomain)
 	}
 
 	// Best effort: the new deployment is already live, and failing to retire
@@ -204,10 +228,10 @@ func (e *Engine) deploy(ctx context.Context, job domain.DeploymentJob, logs *log
 	}
 
 	elapsed := time.Since(started)
-	logs.WriteLine("stdout", fmt.Sprintf("live at %s in %s", result.URL, elapsed.Round(time.Millisecond)))
+	logs.WriteLine("stdout", fmt.Sprintf("live at %s in %s", publicURL, elapsed.Round(time.Millisecond)))
 	e.Log.Info("deployment live",
 		slog.String("deployment_id", job.DeploymentID),
-		slog.String("url", result.URL),
+		slog.String("url", publicURL),
 		slog.Duration("duration", elapsed))
 	return nil
 }
