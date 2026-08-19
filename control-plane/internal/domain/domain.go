@@ -6,8 +6,10 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,21 +23,39 @@ var (
 	// ErrInvalidTransition reports a deployment status change the lifecycle
 	// does not permit, such as reviving a failed deployment.
 	ErrInvalidTransition = errors.New("invalid status transition")
+
+	// ErrNoLiveDeployment reports that an environment exists but has nothing
+	// serving traffic. The proxy keeps it separate from ErrNotFound because a
+	// hostname nobody has deployed to yet and a hostname that was never minted
+	// deserve different answers.
+	ErrNoLiveDeployment = errors.New("no live deployment")
 )
 
 // DeploymentJob is everything a worker needs to build and release one
 // deployment, flattened from the rows it is spread across so the worker makes
 // one query rather than four.
 type DeploymentJob struct {
-	DeploymentID  string
-	ServiceID     string
+	DeploymentID    string
+	ServiceID       string
+	EnvironmentID   string
+	CommitSHA       string
+	RepoURL         string
+	SourcePath      string
+	Port            int
+	ServiceName     string
+	Subdomain       string
+	EnvironmentKind EnvironmentKind
+	EnvironmentName string
+}
+
+// Upstream is where the proxy sends traffic arriving for one environment.
+type Upstream struct {
 	EnvironmentID string
-	CommitSHA     string
-	RepoURL       string
-	SourcePath    string
-	Port          int
-	ServiceName   string
-	Subdomain     string
+	DeploymentID  string
+	// URL is the address the workload itself listens on. It is a detail of
+	// whichever driver released it — a published Docker port here, a Cloud Run
+	// service address later — and is never shown to a user.
+	URL string
 }
 
 // DeploymentLog is one line of build or release output.
@@ -169,8 +189,13 @@ type Environment struct {
 	Kind      EnvironmentKind `json:"kind"`
 	Name      string          `json:"name"`
 	Subdomain string          `json:"subdomain"`
-	CreatedAt time.Time       `json:"created_at"`
-	UpdatedAt time.Time       `json:"updated_at"`
+	// URL is derived from Subdomain when the environment is rendered rather
+	// than stored, because the platform's public domain is configuration: a
+	// column would keep serving the old address after that configuration
+	// changed.
+	URL       string    `json:"url"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type Deployment struct {
@@ -367,6 +392,23 @@ func Subdomain(projectSlug, environmentName string) (string, error) {
 		}
 	}
 	return combined, nil
+}
+
+// PublicURL is the address an environment's deployments answer on. Each
+// environment gets its own hostname under the platform's domain, so a preview
+// and production of the same service can never be reached at one address: the
+// isolation boundary is visible in the URL, not only in the database.
+//
+// The scheme is http because the local proxy terminates nothing; a deployment
+// that sits behind TLS gets it from whatever fronts the proxy.
+func PublicURL(baseDomain string, port int, subdomain string) string {
+	host := subdomain + "." + baseDomain
+	// Port 80 is the default for the scheme, so naming it would only make the
+	// URL longer than the one a user would type.
+	if port != 0 && port != 80 {
+		host = net.JoinHostPort(host, strconv.Itoa(port))
+	}
+	return "http://" + host
 }
 
 // commitSHAPattern matches a full 40-character git object ID. Short SHAs are
