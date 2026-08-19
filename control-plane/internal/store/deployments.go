@@ -82,13 +82,18 @@ func (r *Repository) TransitionDeployment(ctx context.Context, id string, from, 
 
 // MarkDeploymentLive records a successful release along with the artefacts it
 // produced, in the same statement that moves the status.
-func (r *Repository) MarkDeploymentLive(ctx context.Context, id, imageRef, url string) error {
+//
+// Two addresses are stored. publicURL is the environment's stable subdomain,
+// which a user visits and which survives redeployment. internalURL is wherever
+// the driver actually put the workload, which changes every release and is
+// only ever read by the proxy.
+func (r *Repository) MarkDeploymentLive(ctx context.Context, id, imageRef, publicURL, internalURL string) error {
 	const query = `
 		UPDATE deployments
-		SET status = 'live', image_ref = $2, url = $3, completed_at = now()
+		SET status = 'live', image_ref = $2, url = $3, internal_url = $4, completed_at = now()
 		WHERE id = $1 AND status = 'deploying'`
 
-	tag, err := r.pool.Exec(ctx, query, id, imageRef, url)
+	tag, err := r.pool.Exec(ctx, query, id, imageRef, publicURL, internalURL)
 	if err != nil {
 		return fmt.Errorf("mark deployment live: %w", translate(err))
 	}
