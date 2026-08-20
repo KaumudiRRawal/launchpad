@@ -86,6 +86,13 @@ jobs:
 
       - run: npm ci
 
+      # The generated API types are committed, so no build depends on codegen
+      # having been run. Regenerating them here is what stops the two halves
+      # drifting: a specification change nobody propagated fails CI instead of
+      # reaching a browser as a field that does not exist.
+      - name: Check the generated API types are current
+        run: npm run check:api
+
       # `npm run build` runs tsc first, so a type error fails here rather than
       # reaching a browser as a runtime crash.
       - name: Type-check and build

@@ -64,6 +64,14 @@ dashboard-build: dashboard-install ## Type-check the dashboard and bundle it int
 dashboard-test: dashboard-install ## Run the dashboard tests
 	cd $(DASHBOARD) && npm test
 
+.PHONY: api-client
+api-client: dashboard-install ## Regenerate the dashboard's API types from the OpenAPI spec
+	cd $(DASHBOARD) && npm run generate:api
+
+.PHONY: api-client-check
+api-client-check: dashboard-install ## Fail if the generated API types are behind the spec
+	cd $(DASHBOARD) && npm run check:api
+
 .PHONY: vet
 vet: ## Run go vet
 	cd $(CONTROL_PLANE) && go vet ./...
@@ -77,4 +85,4 @@ tidy: ## Sync go.mod and go.sum
 	cd $(CONTROL_PLANE) && go mod tidy
 
 .PHONY: check
-check: fmt vet test dashboard-test ## Format, vet and test both halves — run this before committing
+check: fmt vet test api-client-check dashboard-test ## Format, vet and test both halves — run this before committing
