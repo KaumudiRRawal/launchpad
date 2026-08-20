@@ -34,7 +34,9 @@ describe('ProjectView', () => {
 
     expect(await screen.findByRole('heading', { name: 'Demo App' })).toBeDefined()
     expect(screen.getByText(/port 8080/)).toBeDefined()
-    expect(screen.getByText('prod-demo.localhost')).toBeDefined()
+    // The environment's public address, as the API rendered it — not a
+    // hostname the dashboard assembled for itself.
+    expect(screen.getByRole('link', { name: 'http://prod-demo.localhost:8081' })).toBeDefined()
     // The deploy form's selects are built from those same two lists.
     expect(screen.getByRole('option', { name: 'api' })).toBeDefined()
     expect(screen.getByRole('option', { name: 'prod (production)' })).toBeDefined()

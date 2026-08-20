@@ -268,7 +268,17 @@ function EnvironmentsPanel({
               <div>
                 <span className="list-title">{environment.name}</span>
                 <p className="list-meta">
-                  {environment.kind} · <code>{environment.subdomain}.localhost</code>
+                  {/*
+                    The address comes from the API rather than being assembled
+                    from the subdomain here: the platform's domain and the
+                    proxy's port are the control plane's configuration, and a
+                    dashboard guessing at them is a link that silently stops
+                    working when either changes.
+                  */}
+                  {environment.kind} ·{' '}
+                  <a href={environment.url} target="_blank" rel="noreferrer">
+                    {environment.url}
+                  </a>
                 </p>
               </div>
             </li>
