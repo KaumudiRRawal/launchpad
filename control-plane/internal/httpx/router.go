@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/KaumudiRRawal/launchpad/control-plane/openapi"
 )
 
 // Pinger is the slice of the database pool the readiness check needs. Keeping
@@ -27,43 +29,70 @@ type API struct {
 	ProxyPort  int
 }
 
+// route is one endpoint the API serves. The set is declared as data rather
+// than as a sequence of registration calls so that the conformance test can
+// walk it and hold the OpenAPI document to the same list the router uses,
+// instead of a second list that has to be kept in step by hand.
+type route struct {
+	method  string
+	path    string
+	handler http.HandlerFunc
+	// public marks a route served without a bearer token. Everything else is
+	// mounted behind RequireAuth, so a route added without saying anything
+	// here is authenticated: forgetting to opt in is impossible, where
+	// forgetting to opt out would not be.
+	public bool
+}
+
+// routes lists every endpoint. An orchestrator probing health should not need
+// a credential, the version is not a secret, and neither is the specification:
+// a client generating itself against the API should not have to authenticate
+// to learn its shape.
+func (a *API) routes() []route {
+	return []route{
+		{method: http.MethodGet, path: "/healthz", handler: a.handleHealth, public: true},
+		{method: http.MethodGet, path: "/readyz", handler: a.handleReady, public: true},
+		{method: http.MethodGet, path: "/v1/version", handler: a.handleVersion, public: true},
+		{method: http.MethodGet, path: "/v1/openapi.yaml", handler: a.handleOpenAPI, public: true},
+
+		{method: http.MethodPost, path: "/v1/projects", handler: a.handleCreateProject},
+		{method: http.MethodGet, path: "/v1/projects", handler: a.handleListProjects},
+		{method: http.MethodGet, path: "/v1/projects/{projectID}", handler: a.handleGetProject},
+		{method: http.MethodDelete, path: "/v1/projects/{projectID}", handler: a.handleDeleteProject},
+
+		{method: http.MethodPost, path: "/v1/projects/{projectID}/services", handler: a.handleCreateService},
+		{method: http.MethodGet, path: "/v1/projects/{projectID}/services", handler: a.handleListServices},
+
+		{method: http.MethodPost, path: "/v1/projects/{projectID}/environments", handler: a.handleCreateEnvironment},
+		{method: http.MethodGet, path: "/v1/projects/{projectID}/environments", handler: a.handleListEnvironments},
+
+		{method: http.MethodGet, path: "/v1/projects/{projectID}/deployments", handler: a.handleListDeployments},
+		{method: http.MethodPost, path: "/v1/deployments", handler: a.handleCreateDeployment},
+		{method: http.MethodGet, path: "/v1/deployments/{deploymentID}", handler: a.handleGetDeployment},
+		{method: http.MethodGet, path: "/v1/deployments/{deploymentID}/logs", handler: a.handleDeploymentLogs},
+
+		{method: http.MethodPost, path: "/v1/api-keys", handler: a.handleCreateAPIKey},
+		{method: http.MethodGet, path: "/v1/api-keys", handler: a.handleListAPIKeys},
+		{method: http.MethodDelete, path: "/v1/api-keys/{keyID}", handler: a.handleRevokeAPIKey},
+	}
+}
+
 // Routes returns the fully wired handler, middleware included.
 func (a *API) Routes() http.Handler {
 	mux := http.NewServeMux()
-
-	// Unauthenticated. An orchestrator probing health should not need a
-	// credential, and the version is not a secret.
-	mux.HandleFunc("GET /healthz", a.handleHealth)
-	mux.HandleFunc("GET /readyz", a.handleReady)
-	mux.HandleFunc("GET /v1/version", a.handleVersion)
-
-	// Everything else under /v1 requires a bearer token. Registering these on
-	// their own mux means a new route is authenticated by default: forgetting
-	// to opt in is impossible, where forgetting to opt out would not be.
 	authed := http.NewServeMux()
 
-	authed.HandleFunc("POST /v1/projects", a.handleCreateProject)
-	authed.HandleFunc("GET /v1/projects", a.handleListProjects)
-	authed.HandleFunc("GET /v1/projects/{projectID}", a.handleGetProject)
-	authed.HandleFunc("DELETE /v1/projects/{projectID}", a.handleDeleteProject)
+	for _, rt := range a.routes() {
+		pattern := rt.method + " " + rt.path
+		if rt.public {
+			mux.HandleFunc(pattern, rt.handler)
+			continue
+		}
+		authed.HandleFunc(pattern, rt.handler)
+	}
 
-	authed.HandleFunc("POST /v1/projects/{projectID}/services", a.handleCreateService)
-	authed.HandleFunc("GET /v1/projects/{projectID}/services", a.handleListServices)
-
-	authed.HandleFunc("POST /v1/projects/{projectID}/environments", a.handleCreateEnvironment)
-	authed.HandleFunc("GET /v1/projects/{projectID}/environments", a.handleListEnvironments)
-
-	authed.HandleFunc("GET /v1/projects/{projectID}/deployments", a.handleListDeployments)
-	authed.HandleFunc("POST /v1/deployments", a.handleCreateDeployment)
-	authed.HandleFunc("GET /v1/deployments/{deploymentID}", a.handleGetDeployment)
-	authed.HandleFunc("GET /v1/deployments/{deploymentID}/logs", a.handleDeploymentLogs)
-
-	authed.HandleFunc("POST /v1/api-keys", a.handleCreateAPIKey)
-	authed.HandleFunc("GET /v1/api-keys", a.handleListAPIKeys)
-	authed.HandleFunc("DELETE /v1/api-keys/{keyID}", a.handleRevokeAPIKey)
-
-	// "GET /v1/version" is a more specific pattern than "/v1/", so it still
-	// wins and stays public.
+	// The public /v1 patterns registered above are more specific than "/v1/",
+	// so they still win and stay unauthenticated.
 	mux.Handle("/v1/", RequireAuth(a.Store)(authed))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -104,4 +133,16 @@ func (a *API) handleVersion(w http.ResponseWriter, r *http.Request) {
 		"service": "launchpad-control-plane",
 		"version": a.Version,
 	})
+}
+
+// handleOpenAPI serves the specification this build implements. The document
+// is embedded rather than read from disk so it cannot go missing from a
+// container image, and it is the same file the dashboard's client is generated
+// from, so what a caller reads here is what the client was built against.
+func (a *API) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
+	if _, err := w.Write(openapi.Document); err != nil {
+		LoggerFrom(r.Context()).Warn("write openapi document",
+			slog.String("error", err.Error()))
+	}
 }

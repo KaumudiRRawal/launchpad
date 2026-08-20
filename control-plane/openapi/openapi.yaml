@@ -1,0 +1,967 @@
+openapi: 3.1.0
+
+info:
+  title: Launchpad control plane
+  version: "1.0"
+  license:
+    name: MIT
+    identifier: MIT
+  description: |
+    The control plane is the only component that writes platform state. It owns
+    projects, the services and environments beneath them, and the deployments
+    that release one service at one commit into one environment.
+
+    This document is the contract between the API and everything that calls it.
+    The dashboard's TypeScript client is generated from it, so a field renamed
+    here and nowhere else fails to compile rather than arriving in a browser as
+    `undefined`. The document is also served by the running binary at
+    `/v1/openapi.yaml`, which means the description a caller fetches always
+    belongs to the build that answered them.
+
+servers:
+  - url: http://localhost:8080
+    description: Local control plane
+
+# Authentication is the default rather than something each operation opts into,
+# so a new endpoint added without a `security` key is documented as protected —
+# the same direction the router itself fails in.
+security:
+  - bearerAuth: []
+
+tags:
+  - name: health
+    description: Liveness, readiness and build identification.
+  - name: projects
+    description: A project is one repository and everything deployed from it.
+  - name: services
+    description: A service is one deployable unit of a repository.
+  - name: environments
+    description: An environment is an isolation boundary with its own hostname.
+  - name: deployments
+    description: One service, built at one commit, released into one environment.
+  - name: api-keys
+    description: Credentials for this account.
+
+paths:
+  /healthz:
+    get:
+      operationId: checkLiveness
+      tags: [health]
+      summary: Report process liveness
+      description: |
+        Touches no dependencies. A database blip should not convince an
+        orchestrator to restart an otherwise healthy process; it should only
+        stop routing traffic to it.
+      security: []
+      responses:
+        "200":
+          description: The process is running.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Liveness"
+
+  /readyz:
+    get:
+      operationId: checkReadiness
+      tags: [health]
+      summary: Report whether this instance can serve traffic
+      security: []
+      responses:
+        "200":
+          description: The database is reachable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Readiness"
+        "503":
+          description: The database is not reachable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/version:
+    get:
+      operationId: getVersion
+      tags: [health]
+      summary: Report the running build
+      description: |
+        The revision is stamped in by the Go toolchain, so a running instance
+        can be traced back to a commit without a build flag.
+      security: []
+      responses:
+        "200":
+          description: The build identification of this instance.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Version"
+
+  /v1/openapi.yaml:
+    get:
+      operationId: getOpenAPIDocument
+      tags: [health]
+      summary: Fetch this document
+      description: |
+        Public, because a contract is not a secret: a client generating itself
+        against the API should not need a credential to learn its shape.
+      security: []
+      responses:
+        "200":
+          description: The specification embedded in this binary.
+          content:
+            application/yaml:
+              schema:
+                type: string
+
+  /v1/projects:
+    post:
+      operationId: createProject
+      tags: [projects]
+      summary: Create a project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProjectInput"
+      responses:
+        "201":
+          description: The created project.
+          headers:
+            Location:
+              description: Where the new project can be fetched.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+    get:
+      operationId: listProjects
+      tags: [projects]
+      summary: List your projects
+      responses:
+        "200":
+          description: Every project owned by the authenticated account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectList"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+
+  /v1/projects/{projectID}:
+    get:
+      operationId: getProject
+      tags: [projects]
+      summary: Fetch one project
+      parameters:
+        - $ref: "#/components/parameters/ProjectID"
+      responses:
+        "200":
+          description: The project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteProject
+      tags: [projects]
+      summary: Delete a project and everything under it
+      description: |
+        Services, environments and deployments are removed with the project;
+        the database cascades rather than leaving orphaned rows behind.
+      parameters:
+        - $ref: "#/components/parameters/ProjectID"
+      responses:
+        "204":
+          description: The project no longer exists.
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/projects/{projectID}/services:
+    post:
+      operationId: createService
+      tags: [services]
+      summary: Add a deployable unit to a project
+      parameters:
+        - $ref: "#/components/parameters/ProjectID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateServiceInput"
+      responses:
+        "201":
+          description: The created service.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Service"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+    get:
+      operationId: listServices
+      tags: [services]
+      summary: List a project's services
+      parameters:
+        - $ref: "#/components/parameters/ProjectID"
+      responses:
+        "200":
+          description: Every service in the project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceList"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/projects/{projectID}/environments:
+    post:
+      operationId: createEnvironment
+      tags: [environments]
+      summary: Create a preview or production environment
+      description: |
+        The subdomain is derived from the environment name and the project
+        slug, so it cannot be chosen by the caller and cannot collide with an
+        environment of another project.
+      parameters:
+        - $ref: "#/components/parameters/ProjectID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateEnvironmentInput"
+      responses:
+        "201":
+          description: The created environment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Environment"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            The name is taken, or the project already has a production
+            environment. A project may have at most one.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+    get:
+      operationId: listEnvironments
+      tags: [environments]
+      summary: List a project's environments
+      parameters:
+        - $ref: "#/components/parameters/ProjectID"
+      responses:
+        "200":
+          description: Every environment in the project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvironmentList"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/projects/{projectID}/deployments:
+    get:
+      operationId: listDeployments
+      tags: [deployments]
+      summary: Deployment history for a project
+      description: Newest first, across every service and environment.
+      parameters:
+        - $ref: "#/components/parameters/ProjectID"
+      responses:
+        "200":
+          description: The project's deployments.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentList"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/deployments:
+    post:
+      operationId: createDeployment
+      tags: [deployments]
+      summary: Trigger a deployment
+      description: |
+        Returns as soon as the deployment is queued; a worker picks it up and
+        moves it through building, deploying and live. Follow the build with
+        the logs endpoint and the status with the fetch endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDeploymentInput"
+      responses:
+        "201":
+          description: The queued deployment.
+          headers:
+            Location:
+              description: Where the deployment's status can be fetched.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Deployment"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          description: |
+            The service and environment must both exist, belong to the
+            authenticated account, and share a project. Anything else is
+            reported as not found rather than as a more specific error, so a
+            caller cannot use it to discover which IDs exist.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+
+  /v1/deployments/{deploymentID}:
+    get:
+      operationId: getDeployment
+      tags: [deployments]
+      summary: Fetch a deployment's status
+      parameters:
+        - $ref: "#/components/parameters/DeploymentID"
+      responses:
+        "200":
+          description: The deployment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Deployment"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/deployments/{deploymentID}/logs:
+    get:
+      operationId: getDeploymentLogs
+      tags: [deployments]
+      summary: Read build and release output
+      description: |
+        Logs are followed by polling with a cursor rather than streamed. The
+        client asks for everything after the last sequence number it has seen,
+        so a follower that loses its connection reconnects and misses nothing,
+        where a broken stream would have to be replayed from the start.
+      parameters:
+        - $ref: "#/components/parameters/DeploymentID"
+        - name: after
+          in: query
+          required: false
+          description: |
+            Return only lines with a sequence number greater than this. Pass
+            back the `next_after` of the previous page.
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        "200":
+          description: One page of output and the cursor to resume from.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LogPage"
+        "400":
+          description: The `after` parameter is not a non-negative integer.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/api-keys:
+    post:
+      operationId: createAPIKey
+      tags: [api-keys]
+      summary: Mint an API key
+      description: |
+        The only response that ever carries the plaintext token. Keys are
+        stored as SHA-256 hashes, so a lost token cannot be recovered — only
+        replaced.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAPIKeyInput"
+      responses:
+        "201":
+          description: The created key and its one-time token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatedAPIKey"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+    get:
+      operationId: listAPIKeys
+      tags: [api-keys]
+      summary: List this account's keys
+      description: Never the secrets; only the prefix that identifies each one.
+      responses:
+        "200":
+          description: Every key, revoked ones included.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKeyList"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+
+  /v1/api-keys/{keyID}:
+    delete:
+      operationId: revokeAPIKey
+      tags: [api-keys]
+      summary: Revoke a key
+      description: |
+        Revoking is not deleting: the row stays so an audit of what a key did
+        still has a name to point at.
+      parameters:
+        - name: keyID
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: The key no longer authenticates.
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          description: No such key, or it was already revoked.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        A token from `POST /v1/api-keys`. The first one is minted against the
+        database by an operator, because minting a key through the API requires
+        already holding one.
+
+  parameters:
+    ProjectID:
+      name: projectID
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    DeploymentID:
+      name: deploymentID
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    Unauthenticated:
+      description: The bearer token is missing, unknown or revoked.
+      headers:
+        WWW-Authenticate:
+          description: How to authenticate, as RFC 7235 requires of a 401.
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: |
+        No such resource, or it belongs to another account. The two are
+        reported identically so a caller cannot confirm that an ID exists.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: A resource with those details already exists.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ValidationFailed:
+      description: |
+        One or more fields are invalid. Every rejected field is listed at once,
+        so a caller correcting a form never has to resubmit to discover the
+        next mistake.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ValidationError"
+
+  schemas:
+    Liveness:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
+
+    Readiness:
+      type: object
+      required: [status, database]
+      properties:
+        status:
+          type: string
+        database:
+          type: string
+
+    Version:
+      type: object
+      required: [service, version]
+      properties:
+        service:
+          type: string
+        version:
+          type: string
+          description: The VCS revision this binary was built from.
+
+    EnvironmentKind:
+      type: string
+      description: |
+        Previews are unbounded; a project may have at most one production
+        environment, which a partial unique index enforces.
+      enum: [preview, production]
+
+    DeploymentStatus:
+      type: string
+      description: |
+        The deployment lifecycle. `live`, `failed` and `superseded` are
+        terminal: a deployment in one of them will not change again on its own,
+        which is what tells a client to stop polling.
+      enum: [queued, building, deploying, live, failed, superseded]
+
+    Project:
+      type: object
+      required: [id, account_id, slug, name, repo_url, default_branch, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        account_id:
+          type: string
+          format: uuid
+        slug:
+          type: string
+          description: A DNS label, because it becomes part of every environment hostname.
+        name:
+          type: string
+        repo_url:
+          type: string
+          format: uri
+        default_branch:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    Service:
+      type: object
+      required: [id, project_id, name, source_path, port, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        project_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        source_path:
+          type: string
+          description: Where in the repository this service is built from.
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: The port the workload listens on inside its container.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    Environment:
+      type: object
+      required: [id, project_id, kind, name, subdomain, url, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        project_id:
+          type: string
+          format: uuid
+        kind:
+          $ref: "#/components/schemas/EnvironmentKind"
+        name:
+          type: string
+        subdomain:
+          type: string
+          description: The hostname label this environment answers on.
+        url:
+          type: string
+          format: uri
+          description: |
+            The environment's public address, which survives redeployment.
+            Derived from the subdomain and the platform's domain when the
+            environment is rendered rather than stored, because that domain is
+            configuration: a column would keep serving the old address after
+            the configuration changed.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    Deployment:
+      type: object
+      required: [id, service_id, environment_id, commit_sha, status, queued_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        service_id:
+          type: string
+          format: uuid
+        environment_id:
+          type: string
+          format: uuid
+        commit_sha:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+          description: |
+            A full 40-character object ID. Short SHAs are rejected: a
+            deployment names one commit forever, and a short SHA can become
+            ambiguous as the repository grows.
+        status:
+          $ref: "#/components/schemas/DeploymentStatus"
+        image_ref:
+          type: string
+          description: The image built for this deployment. Absent until the build succeeds.
+        url:
+          type: string
+          format: uri
+          description: |
+            The environment's public address, repeated here so a caller
+            watching one deployment does not have to fetch the environment to
+            learn where it landed. Absent until the deployment is live.
+        error_message:
+          type: string
+          description: Why the deployment failed. Absent unless it did.
+        queued_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+          description: When a worker claimed the deployment.
+        completed_at:
+          type: string
+          format: date-time
+          description: When the deployment reached a terminal status.
+
+    DeploymentLog:
+      type: object
+      required: [seq, stream, message, logged_at]
+      properties:
+        seq:
+          type: integer
+          description: Monotonic within one deployment. The cursor a follower resumes from.
+        stream:
+          type: string
+          description: Which output this line came from, such as `stdout` or `stderr`.
+        message:
+          type: string
+        logged_at:
+          type: string
+          format: date-time
+
+    APIKey:
+      type: object
+      required: [id, account_id, name, token_prefix, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        account_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        token_prefix:
+          type: string
+          description: |
+            The leading characters of the token, enough to recognise a key in a
+            list without being enough to use it.
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+          description: Absent until the key authenticates a request.
+        revoked_at:
+          type: string
+          format: date-time
+          description: Absent while the key still works.
+
+    ProjectList:
+      type: object
+      required: [projects]
+      properties:
+        projects:
+          type: array
+          items:
+            $ref: "#/components/schemas/Project"
+
+    ServiceList:
+      type: object
+      required: [services]
+      properties:
+        services:
+          type: array
+          items:
+            $ref: "#/components/schemas/Service"
+
+    EnvironmentList:
+      type: object
+      required: [environments]
+      properties:
+        environments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Environment"
+
+    DeploymentList:
+      type: object
+      required: [deployments]
+      properties:
+        deployments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Deployment"
+
+    APIKeyList:
+      type: object
+      required: [api_keys]
+      properties:
+        api_keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/APIKey"
+
+    CreatedAPIKey:
+      type: object
+      required: [api_key, token, warning]
+      properties:
+        api_key:
+          $ref: "#/components/schemas/APIKey"
+        token:
+          type: string
+          description: The plaintext credential. Returned once and never again.
+        warning:
+          type: string
+
+    LogPage:
+      type: object
+      required: [logs, next_after]
+      properties:
+        logs:
+          type: array
+          items:
+            $ref: "#/components/schemas/DeploymentLog"
+        next_after:
+          type: integer
+          description: |
+            Where to resume. Echoed back as `after` on the next request, so a
+            follower never has to reason about sequence numbers itself.
+
+    CreateProjectInput:
+      type: object
+      required: [slug, name, repo_url]
+      properties:
+        slug:
+          type: string
+          maxLength: 63
+          pattern: "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+        name:
+          type: string
+          maxLength: 200
+        repo_url:
+          type: string
+          format: uri
+          description: |
+            An http or https clone URL. SSH remotes are rejected because the
+            builder authenticates with a token rather than a deploy key, so an
+            `ssh://` URL would fail later at clone time with a far less obvious
+            error.
+        default_branch:
+          type: string
+          default: main
+
+    CreateServiceInput:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          maxLength: 63
+          pattern: "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+        source_path:
+          type: string
+          default: "."
+          description: |
+            Relative to the repository root. An absolute path, or one
+            containing `..`, is refused rather than sanitised.
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          default: 8080
+
+    CreateEnvironmentInput:
+      type: object
+      required: [kind, name]
+      properties:
+        kind:
+          $ref: "#/components/schemas/EnvironmentKind"
+        name:
+          type: string
+          maxLength: 63
+          pattern: "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+
+    CreateDeploymentInput:
+      type: object
+      required: [service_id, environment_id, commit_sha]
+      properties:
+        service_id:
+          type: string
+          format: uuid
+        environment_id:
+          type: string
+          format: uuid
+          description: Must belong to the same project as the service.
+        commit_sha:
+          type: string
+          pattern: "^[0-9a-fA-F]{40}$"
+
+    CreateAPIKeyInput:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          maxLength: 200
+          description: How you will recognise this key in a list.
+
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+        message:
+          type: string
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: A stable identifier a client can branch on.
+            message:
+              type: string
+              description: Human-readable, and not something to parse.
+            request_id:
+              type: string
+              description: |
+                Echoed from the request, so a user reporting a failure can be
+                traced straight to its log line.
+
+    ValidationError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, fields]
+          properties:
+            code:
+              type: string
+              const: validation_failed
+            message:
+              type: string
+            request_id:
+              type: string
+            fields:
+              type: array
+              items:
+                $ref: "#/components/schemas/FieldError"
