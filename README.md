@@ -76,9 +76,10 @@ make dashboard  # in another shell: serve the UI on :5173
 ```
 
 ```bash
-curl localhost:8080/healthz      # liveness — never touches the database
-curl localhost:8080/readyz       # readiness — fails if PostgreSQL is unreachable
-curl localhost:8080/v1/version   # build revision
+curl localhost:8080/healthz         # liveness — never touches the database
+curl localhost:8080/readyz          # readiness — fails if PostgreSQL is unreachable
+curl localhost:8080/v1/version      # build revision
+curl localhost:8080/v1/openapi.yaml # the API's own specification
 ```
 
 Run `make help` for every target.
@@ -108,8 +109,13 @@ origin and the API carries no CORS headers. See `dashboard/README.md`.
 
 ## API
 
-Every route under `/v1` except `/v1/version` requires
+Every route under `/v1` except `/v1/version` and `/v1/openapi.yaml` requires
 `Authorization: Bearer <token>`.
+
+The contract is [`control-plane/openapi/openapi.yaml`](control-plane/openapi/openapi.yaml).
+It is embedded in the binary and served at `/v1/openapi.yaml`, so the document a
+caller fetches always belongs to the build that answered them, and the
+dashboard's TypeScript types are generated from it with `make api-client`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -159,6 +165,7 @@ correcting a form never has to resubmit to discover the next mistake:
 make test              # Go unit tests, no dependencies
 make test-integration  # adds tests that run migrations against a live database
 make dashboard-test    # dashboard tests
+make api-client-check  # fails if the generated types are behind the spec
 make check             # everything, before committing
 ```
 
@@ -215,10 +222,23 @@ few polls after the status becomes terminal: the engine marks a deployment live
 and only then flushes its final lines, so the line naming the URL arrives *after*
 the status that says the deployment is finished.
 
-**The dashboard's wire types live in one module.** Components import their types
-from `src/api/types.ts` and reach HTTP through `src/api/client.ts` alone, so the
-hand-mirrored declarations can be swapped for generated ones without touching a
-single component.
+**The specification is checked against the code, not written beside it.** A Go
+test walks the router's route table and the document's paths and fails on any
+endpoint one has and the other does not — including a route the document calls
+public that the router authenticates. A second compares each schema's properties
+against the JSON tags of the struct the handlers encode, and its `required` list
+against the fields carrying no `omitempty`. CI regenerates the dashboard's types
+and fails if the committed ones differ. A specification nobody verifies is a
+comment that happens to be YAML.
+
+**The specification generates the dashboard's types, not its transport.**
+`src/api/types.ts` is aliases into a generated file, and the client's paths are
+constrained to the ones the document declares, so a renamed route or field fails
+`tsc` instead of the browser. The fetch layer stays hand-written: a generated
+client reports failures as result objects rather than throwing, and rebuilding
+the field-level 422 handling the forms depend on would cost more than the sixty
+lines it replaced. Generating the part that has to be exact and writing the part
+that has to be pleasant is cheaper than either alone.
 
 **Environments are reached through a proxy, never directly.** Each environment
 answers on its own hostname under the platform's domain, so a preview and a
@@ -251,8 +271,9 @@ Built in public over seven days. Each day is a working increment.
       Docker driver, state machine, streamed build logs
 - [x] **Day 4** — React + TypeScript dashboard: project and deployment
       management, live build logs
-- [ ] **Day 5** — Preview environments, subdomain routing, typed contracts
-      *(routing and isolation done; OpenAPI-generated client still to come)*
+- [x] **Day 5** — Preview environments, subdomain routing, typed contracts:
+      an OpenAPI 3 specification the tests hold the code to, and the
+      dashboard's types generated from it
 - [ ] **Day 6** — Latency and reliability analysis
 - [ ] **Day 7** — Terraform modules, Cloud Run driver, documentation
 
