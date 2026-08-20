@@ -38,6 +38,7 @@ export function environment(over: Partial<Environment> = {}): Environment {
     kind: 'production',
     name: 'prod',
     subdomain: 'prod-demo',
+    url: 'http://prod-demo.localhost:8081',
     created_at: at,
     updated_at: at,
     ...over,

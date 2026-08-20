@@ -95,6 +95,17 @@ describe('request shape', () => {
     expect(calls[0]?.url).toBe('/v1/projects/a%20b%2F..%2Fc')
   })
 
+  it('refuses to build a path from a missing identifier', () => {
+    const { client } = harness(() => ok(project()))
+
+    // The generated path types make this unreachable from TypeScript. A
+    // JavaScript caller can still manage it, and requesting
+    // /v1/projects/undefined would answer 404 as if the project were gone.
+    expect(() => client.getProject(undefined as unknown as string)).toThrow(
+      'missing path parameter projectID',
+    )
+  })
+
   it('prefixes a configured base URL', async () => {
     const calls: string[] = []
     const client = newClient({

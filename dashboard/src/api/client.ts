@@ -1,3 +1,4 @@
+import type { components, paths } from './schema'
 import type {
   CreateDeploymentInput,
   CreateEnvironmentInput,
@@ -9,6 +10,13 @@ import type {
   Project,
   Service,
 } from './types'
+
+/**
+ * The collection envelopes the API wraps its lists in. They are read from the
+ * generated schema rather than restated here, so the key a response is
+ * unwrapped by is the key the server documents.
+ */
+type Schemas = components['schemas']
 
 /** FieldError is one rejected field from a 422 response. */
 export interface FieldError {
@@ -144,56 +152,89 @@ export function newClient(options: ClientOptions): Client {
     listProjects: (signal) =>
       // The API wraps collections in a named key. Unwrapping here means no
       // component ever has to know that.
-      request<{ projects: Project[] }>('/v1/projects', { ...maybeSignal(signal) }).then(
+      request<Schemas['ProjectList']>(apiPath('/v1/projects'), { ...maybeSignal(signal) }).then(
         (body) => body.projects ?? [],
       ),
-    createProject: (input) => request<Project>('/v1/projects', { method: 'POST', body: input }),
+    createProject: (input) =>
+      request<Project>(apiPath('/v1/projects'), { method: 'POST', body: input }),
     getProject: (projectID, signal) =>
-      request<Project>(`/v1/projects/${encodeURIComponent(projectID)}`, {
+      request<Project>(apiPath('/v1/projects/{projectID}', { projectID }), {
         ...maybeSignal(signal),
       }),
     deleteProject: (projectID) =>
-      request<void>(`/v1/projects/${encodeURIComponent(projectID)}`, { method: 'DELETE' }),
+      request<void>(apiPath('/v1/projects/{projectID}', { projectID }), { method: 'DELETE' }),
 
     listServices: (projectID, signal) =>
-      request<{ services: Service[] }>(
-        `/v1/projects/${encodeURIComponent(projectID)}/services`,
-        { ...maybeSignal(signal) },
-      ).then((body) => body.services ?? []),
+      request<Schemas['ServiceList']>(apiPath('/v1/projects/{projectID}/services', { projectID }), {
+        ...maybeSignal(signal),
+      }).then((body) => body.services ?? []),
     createService: (projectID, input) =>
-      request<Service>(`/v1/projects/${encodeURIComponent(projectID)}/services`, {
+      request<Service>(apiPath('/v1/projects/{projectID}/services', { projectID }), {
         method: 'POST',
         body: input,
       }),
 
     listEnvironments: (projectID, signal) =>
-      request<{ environments: Environment[] }>(
-        `/v1/projects/${encodeURIComponent(projectID)}/environments`,
+      request<Schemas['EnvironmentList']>(
+        apiPath('/v1/projects/{projectID}/environments', { projectID }),
         { ...maybeSignal(signal) },
       ).then((body) => body.environments ?? []),
     createEnvironment: (projectID, input) =>
-      request<Environment>(`/v1/projects/${encodeURIComponent(projectID)}/environments`, {
+      request<Environment>(apiPath('/v1/projects/{projectID}/environments', { projectID }), {
         method: 'POST',
         body: input,
       }),
 
     listDeployments: (projectID, signal) =>
-      request<{ deployments: Deployment[] }>(
-        `/v1/projects/${encodeURIComponent(projectID)}/deployments`,
+      request<Schemas['DeploymentList']>(
+        apiPath('/v1/projects/{projectID}/deployments', { projectID }),
         { ...maybeSignal(signal) },
       ).then((body) => body.deployments ?? []),
     createDeployment: (input) =>
-      request<Deployment>('/v1/deployments', { method: 'POST', body: input }),
+      request<Deployment>(apiPath('/v1/deployments'), { method: 'POST', body: input }),
     getDeployment: (deploymentID, signal) =>
-      request<Deployment>(`/v1/deployments/${encodeURIComponent(deploymentID)}`, {
+      request<Deployment>(apiPath('/v1/deployments/{deploymentID}', { deploymentID }), {
         ...maybeSignal(signal),
       }),
     deploymentLogs: (deploymentID, after, signal) =>
       request<LogPage>(
-        `/v1/deployments/${encodeURIComponent(deploymentID)}/logs?after=${after}`,
+        `${apiPath('/v1/deployments/{deploymentID}/logs', { deploymentID })}?after=${after}`,
         { ...maybeSignal(signal) },
       ),
   }
+}
+
+/**
+ * PathParams is the placeholders a path template declares, as a record the
+ * caller has to fill: `/v1/projects/{projectID}` demands a projectID and
+ * nothing besides.
+ */
+type PathParams<P extends string> = P extends `${string}{${infer Name}}${infer Rest}`
+  ? Record<Name, string> & PathParams<Rest>
+  : object
+
+/** PathArgs drops the argument entirely on a template with no placeholders. */
+type PathArgs<P extends string> = keyof PathParams<P> extends never ? [] : [params: PathParams<P>]
+
+/**
+ * apiPath fills a path template declared by the specification. Constraining
+ * the template to `keyof paths` is what binds this module to the generated
+ * schema: a route the control plane stops describing, or a parameter it
+ * renames, fails to compile here rather than 404ing in a browser.
+ */
+function apiPath<P extends keyof paths & string>(template: P, ...args: PathArgs<P>): string {
+  const [params = {}] = args as [Record<string, string | undefined>?]
+
+  return template.replace(/\{(\w+)\}/g, (_, name: string) => {
+    const value = params[name]
+    if (value === undefined) {
+      // Unreachable through the types; it exists because an ID read out of a
+      // URL fragment reaches here as a plain string and an empty one would
+      // otherwise silently request the collection instead of the member.
+      throw new Error(`missing path parameter ${name}`)
+    }
+    return encodeURIComponent(value)
+  })
 }
 
 /**

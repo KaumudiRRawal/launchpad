@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "generate:api": "openapi-typescript ../control-plane/openapi/openapi.yaml --default-non-nullable false --output src/api/schema.ts",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "check:api": "openapi-typescript ../control-plane/openapi/openapi.yaml --default-non-nullable false --output src/api/schema.ts --check"
   },
   "dependencies": {
     "react": "^19.2.0",
@@ -20,6 +22,7 @@
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.0.0",
     "jsdom": "^27.0.0",
+    "openapi-typescript": "^7.13.0",
     "typescript": "~5.9.0",
     "vite": "^7.1.0",
     "vitest": "^3.2.0"
