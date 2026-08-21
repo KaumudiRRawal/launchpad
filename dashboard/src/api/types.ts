@@ -21,6 +21,20 @@ export type Environment = Schemas['Environment']
 export type Deployment = Schemas['Deployment']
 export type DeploymentLog = Schemas['DeploymentLog']
 
+export type EnvironmentMetrics = Schemas['EnvironmentMetrics']
+export type MetricSummary = Schemas['MetricSummary']
+export type MetricPoint = Schemas['MetricPoint']
+
+/**
+ * AnalysisReport is the comparison of an environment's recent traffic against
+ * the period before it: what has got worse, and the steps to take in the order
+ * they are worth taking.
+ */
+export type AnalysisReport = Schemas['AnalysisReport']
+export type Finding = Schemas['Finding']
+export type Remediation = Schemas['Remediation']
+export type Verdict = Schemas['Verdict']
+
 /**
  * LogPage is one slice of a deployment's output. next_after is the cursor to
  * pass back as `after`, so a follower never has to reason about sequence

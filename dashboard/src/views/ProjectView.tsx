@@ -5,6 +5,7 @@ import type { Deployment, Environment, EnvironmentKind, Service } from '../api/t
 import { DeploymentPanel } from '../components/DeploymentPanel'
 import { ErrorBanner } from '../components/ErrorBanner'
 import { Field } from '../components/Field'
+import { HealthPanel } from '../components/HealthPanel'
 import { StatusBadge } from '../components/StatusBadge'
 import { relativeTime, shortSHA } from '../format'
 import { useAction } from '../hooks/useAction'
@@ -80,6 +81,8 @@ export function ProjectView({ client, projectID, deploymentID }: ProjectViewProp
         error={environments.error}
         onCreated={environments.reload}
       />
+
+      <HealthPanel client={client} environments={environmentList} />
 
       <DeployForm
         client={client}

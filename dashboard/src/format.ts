@@ -100,3 +100,48 @@ export function elapsed(
   }
   return formatDuration(to.getTime() - from.getTime())
 }
+
+/**
+ * formatLatency renders a millisecond latency the way someone says it out
+ * loud. Distinct from formatDuration, which rounds to whole seconds: a p95 of
+ * 1.4 seconds must not be reported as "1s".
+ *
+ * Exactly zero means nothing was measured — the collector records a fast
+ * handler as a fraction of a millisecond, never as free — so it reads as a dash
+ * rather than as an impossibly quick response.
+ */
+export function formatLatency(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) {
+    return ''
+  }
+  if (ms === 0) {
+    return '—'
+  }
+  if (ms < 1) {
+    return '<1ms'
+  }
+  if (ms < 1000) {
+    return `${Math.round(ms)}ms`
+  }
+  return `${(ms / 1000).toFixed(1)}s`
+}
+
+/**
+ * formatPercent renders a 0–1 fraction. One decimal place, because the
+ * difference between 99.9% and 100% availability is the whole point of showing
+ * it and rounding would hide it.
+ */
+export function formatPercent(fraction: number): string {
+  if (!Number.isFinite(fraction)) {
+    return ''
+  }
+  return `${(fraction * 100).toFixed(1)}%`
+}
+
+/** formatPerHour rounds a rate to whole requests; the fraction is noise. */
+export function formatPerHour(rate: number): string {
+  if (!Number.isFinite(rate) || rate < 0) {
+    return ''
+  }
+  return `${Math.round(rate).toLocaleString()}/h`
+}

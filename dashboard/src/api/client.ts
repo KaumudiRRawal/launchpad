@@ -1,11 +1,13 @@
 import type { components, paths } from './schema'
 import type {
+  AnalysisReport,
   CreateDeploymentInput,
   CreateEnvironmentInput,
   CreateProjectInput,
   CreateServiceInput,
   Deployment,
   Environment,
+  EnvironmentMetrics,
   LogPage,
   Project,
   Service,
@@ -77,6 +79,12 @@ export interface Client {
 
   listEnvironments(projectID: string, signal?: AbortSignal): Promise<Environment[]>
   createEnvironment(projectID: string, input: CreateEnvironmentInput): Promise<Environment>
+  environmentMetrics(
+    environmentID: string,
+    window: string,
+    signal?: AbortSignal,
+  ): Promise<EnvironmentMetrics>
+  environmentAnalysis(environmentID: string, signal?: AbortSignal): Promise<AnalysisReport>
 
   listDeployments(projectID: string, signal?: AbortSignal): Promise<Deployment[]>
   createDeployment(input: CreateDeploymentInput): Promise<Deployment>
@@ -184,6 +192,20 @@ export function newClient(options: ClientOptions): Client {
         method: 'POST',
         body: input,
       }),
+
+    environmentMetrics: (environmentID, window, signal) =>
+      request<EnvironmentMetrics>(
+        `${apiPath('/v1/environments/{environmentID}/metrics', { environmentID })}?window=${encodeURIComponent(window)}`,
+        { ...maybeSignal(signal) },
+      ),
+    // The window is the server's default: the report is a comparison, and a
+    // dashboard choosing the period it compares over would be choosing how
+    // sensitive the answer is without saying so.
+    environmentAnalysis: (environmentID, signal) =>
+      request<AnalysisReport>(
+        apiPath('/v1/environments/{environmentID}/analysis', { environmentID }),
+        { ...maybeSignal(signal) },
+      ),
 
     listDeployments: (projectID, signal) =>
       request<Schemas['DeploymentList']>(

@@ -1,6 +1,16 @@
 import { describe, expect, it } from 'vitest'
 
-import { elapsed, formatClock, formatDuration, relativeTime, shortSHA, stripAnsi } from './format'
+import {
+  elapsed,
+  formatClock,
+  formatDuration,
+  formatLatency,
+  formatPerHour,
+  formatPercent,
+  relativeTime,
+  shortSHA,
+  stripAnsi,
+} from './format'
 
 describe('shortSHA', () => {
   it('trims to a readable length and leaves a short input alone', () => {
@@ -121,4 +131,45 @@ describe('stripAnsi', () => {
       expect(stripAnsi(tc.line)).toBe(tc.want)
     })
   }
+})
+
+describe('formatLatency', () => {
+  const cases: { name: string; ms: number; want: string }[] = [
+    // Nothing measured, rather than an impossibly quick response.
+    { name: 'no measurement', ms: 0, want: '\u2014' },
+    // The collector records a fast handler as a fraction of a millisecond, so
+    // this has to read as fast rather than as free.
+    { name: 'sub-millisecond', ms: 0.4, want: '<1ms' },
+    { name: 'milliseconds', ms: 42.6, want: '43ms' },
+    { name: 'just under a second', ms: 999, want: '999ms' },
+    // A p95 of 1.4 seconds must not be reported as "1s", which is what
+    // formatDuration would say.
+    { name: 'seconds keep a decimal', ms: 1400, want: '1.4s' },
+    { name: 'nonsense', ms: Number.NaN, want: '' },
+  ]
+
+  for (const tc of cases) {
+    it(tc.name, () => {
+      expect(formatLatency(tc.ms)).toBe(tc.want)
+    })
+  }
+})
+
+describe('formatPercent', () => {
+  it('keeps the decimal that availability lives in', () => {
+    // 99.9% and 100% are the difference between a healthy service and one
+    // dropping a request in a thousand; rounding would hide it.
+    expect(formatPercent(0.999)).toBe('99.9%')
+    expect(formatPercent(1)).toBe('100.0%')
+    expect(formatPercent(0)).toBe('0.0%')
+    expect(formatPercent(Number.NaN)).toBe('')
+  })
+})
+
+describe('formatPerHour', () => {
+  it('rounds a rate to whole requests', () => {
+    expect(formatPerHour(1139.6)).toBe('1,140/h')
+    expect(formatPerHour(0)).toBe('0/h')
+    expect(formatPerHour(-1)).toBe('')
+  })
 })

@@ -166,6 +166,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/environments/{environmentID}/metrics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Latency and reliability for one environment
+         * @description Measured at the proxy, because every request to a deployed workload
+         *     already passes through it: nothing has to be installed in the
+         *     application, and a workload that has stopped answering is measured by
+         *     the same code that measured it while it was healthy. An agent inside the
+         *     container would go quiet at exactly the moment its numbers mattered.
+         *
+         *     Percentiles are interpolated from the stored latency distribution rather
+         *     than averaged from per-minute percentiles, because the mean of two p95s
+         *     is not the p95 of anything.
+         */
+        get: operations["getEnvironmentMetrics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/environments/{environmentID}/analysis": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * What has got worse, and what to do about it
+         * @description Compares the most recent window against the period before it — four
+         *     times as long, so one slow minute cannot move the thing being compared
+         *     against — and reports the regressions with the evidence for each.
+         *
+         *     Every number is derived from observations the proxy made. That includes
+         *     the figure the remediation steps are ranked by: it is the measured cost
+         *     of the problem in requests per hour, not a prediction of how well the
+         *     step will work. The platform can see how much traffic a regression
+         *     affects; it cannot see the future.
+         *
+         *     A window with too little traffic to judge is reported as
+         *     `insufficient_data` rather than as healthy. An environment nobody called
+         *     has not been shown to work.
+         */
+        get: operations["getEnvironmentAnalysis"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{projectID}/deployments": {
         parameters: {
             query?: never;
@@ -426,6 +486,132 @@ export interface components {
             /** Format: date-time */
             logged_at: string;
         };
+        /**
+         * @description How much a finding deserves attention. There is no informational level
+         *     on purpose: a finding the report will not ask anyone to act on is noise,
+         *     and a report full of noise stops being read.
+         * @enum {string}
+         */
+        Severity: "warning" | "critical";
+        /**
+         * @description The whole report in one word. `insufficient_data` is deliberately not
+         *     `healthy` — an environment nobody called has not been shown to work.
+         * @enum {string}
+         */
+        Verdict: "insufficient_data" | "healthy" | "degraded" | "failing";
+        MetricSummary: {
+            requests: number;
+            /**
+             * @description Requests answered with a 5xx, the proxy's own 502 for an
+             *     unreachable workload included. A 404 the application chose to
+             *     return is its own business and says nothing about its health.
+             */
+            failures: number;
+            /**
+             * @description The fraction of requests that did not fail, and 1 when there was no
+             *     traffic at all.
+             */
+            availability: number;
+            latency_avg_ms: number;
+            latency_p50_ms: number;
+            latency_p95_ms: number;
+            latency_p99_ms: number;
+            /**
+             * @description Recorded exactly rather than read off the histogram, so the worst
+             *     request in a window is reported as what it was even where the
+             *     percentiles have saturated at the largest bucket.
+             */
+            latency_max_ms: number;
+        };
+        MetricWindow: {
+            /** Format: date-time */
+            from: string;
+            /** Format: date-time */
+            to: string;
+            summary: components["schemas"]["MetricSummary"];
+        };
+        MetricPoint: {
+            /**
+             * Format: date-time
+             * @description The start of the minute, not the end.
+             */
+            bucket: string;
+            requests: number;
+            failures: number;
+            latency_p95_ms: number;
+        };
+        EnvironmentMetrics: {
+            /** Format: uuid */
+            environment_id: string;
+            window: components["schemas"]["MetricWindow"];
+            /**
+             * @description One point per minute, across every deployment that served the
+             *     environment. A release in the middle of a window does not break the
+             *     line: traffic is continuous even though the deployment behind it is
+             *     not.
+             */
+            series: components["schemas"]["MetricPoint"][];
+        };
+        Finding: {
+            /**
+             * @description A stable identifier a client can branch on. The prose beside it may
+             *     be reworded.
+             * @enum {string}
+             */
+            code: "latency_regression" | "reliability_regression" | "elevated_failure_rate" | "latency_tail_spread";
+            severity: components["schemas"]["Severity"];
+            summary: string;
+            detail: string;
+            /**
+             * @description Which field of MetricSummary the two values below were taken from,
+             *     so a client can point at a number it is already showing.
+             */
+            metric: string;
+            baseline_value: number;
+            current_value: number;
+            /**
+             * @description How much traffic this finding costs, measured from the window's own
+             *     latency distribution and scaled to an hour so findings from windows
+             *     of different lengths can be compared.
+             */
+            affected_requests_per_hour: number;
+        };
+        Remediation: {
+            /**
+             * @description A stable identifier for the kind of step.
+             * @enum {string}
+             */
+            action: "roll_back_deployment" | "profile_the_request_path" | "inspect_failing_requests" | "investigate_the_slow_path";
+            summary: string;
+            detail: string;
+            /** @description The code of the finding this step answers. */
+            finding: string;
+            /**
+             * @description Inherited from that finding, and what orders this list. It is what
+             *     the step stands to recover if it works, not a claim that it will:
+             *     the platform can measure how much traffic a problem affects and
+             *     cannot measure how good a fix will be.
+             */
+            affected_requests_per_hour: number;
+        };
+        AnalysisReport: {
+            /** Format: uuid */
+            environment_id: string;
+            /** Format: date-time */
+            generated_at: string;
+            verdict: components["schemas"]["Verdict"];
+            /**
+             * @description The verdict in one sentence, including why a report says nothing
+             *     when it says nothing.
+             */
+            detail: string;
+            baseline: components["schemas"]["MetricWindow"];
+            current: components["schemas"]["MetricWindow"];
+            /** @description The evidence, worst first. */
+            findings: components["schemas"]["Finding"][];
+            /** @description The steps, in the order they are worth taking. */
+            remediations: components["schemas"]["Remediation"][];
+        };
         APIKey: {
             /** Format: uuid */
             id: string;
@@ -599,6 +785,7 @@ export interface components {
     parameters: {
         ProjectID: string;
         DeploymentID: string;
+        EnvironmentID: string;
     };
     requestBodies: never;
     headers: never;
@@ -908,6 +1095,87 @@ export interface operations {
                 };
             };
             422: components["responses"]["ValidationFailed"];
+        };
+    };
+    getEnvironmentMetrics: {
+        parameters: {
+            query?: {
+                /**
+                 * @description How far back to look, as a duration such as `15m` or `6h`. Bounded
+                 *     at both ends: below a minute there are too few requests for a
+                 *     percentile to describe anything, and above a day the response holds
+                 *     more minutes than a caller can use.
+                 */
+                window?: string;
+            };
+            header?: never;
+            path: {
+                environmentID: components["parameters"]["EnvironmentID"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The window's totals and the minutes behind them. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentMetrics"];
+                };
+            };
+            /** @description The `window` parameter is not a duration in range. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    getEnvironmentAnalysis: {
+        parameters: {
+            query?: {
+                /**
+                 * @description The recent period to judge, as a duration such as `15m`. The
+                 *     baseline reaches four times further back, so the ceiling here is
+                 *     lower than on the metrics endpoint.
+                 */
+                window?: string;
+            };
+            header?: never;
+            path: {
+                environmentID: components["parameters"]["EnvironmentID"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The report. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AnalysisReport"];
+                };
+            };
+            /** @description The `window` parameter is not a duration in range. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            404: components["responses"]["NotFound"];
         };
     };
     listDeployments: {

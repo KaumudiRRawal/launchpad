@@ -2,7 +2,15 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { Client } from '../api/client'
-import { deployment, environment, logLine, project, service } from '../test/fixtures'
+import {
+  analysisReport,
+  deployment,
+  environment,
+  environmentMetrics,
+  logLine,
+  project,
+  service,
+} from '../test/fixtures'
 import { ProjectView } from './ProjectView'
 
 /**
@@ -20,6 +28,8 @@ function stubClient(over: Partial<Client> = {}): Client {
     createService: () => Promise.resolve(service()),
     listEnvironments: () => Promise.resolve([environment()]),
     createEnvironment: () => Promise.resolve(environment()),
+    environmentMetrics: () => Promise.resolve(environmentMetrics()),
+    environmentAnalysis: () => Promise.resolve(analysisReport()),
     listDeployments: () => Promise.resolve([deployment({ status: 'live' })]),
     createDeployment: () => Promise.resolve(deployment()),
     getDeployment: () => Promise.resolve(deployment({ status: 'live' })),

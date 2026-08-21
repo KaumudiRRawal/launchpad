@@ -1,7 +1,8 @@
 # Launchpad dashboard
 
 React + TypeScript, built with Vite. Lists projects, creates them, adds services
-and environments, triggers a deployment and follows its build log.
+and environments, triggers a deployment and follows its build log, and shows
+what each environment's deployed application is actually doing.
 
 ```bash
 npm install
@@ -46,6 +47,19 @@ Generation passes `--default-non-nullable false`. A field with a default —
 `default_branch`, `source_path`, `port` — is optional to *send* and always
 present in the *reply*, which the two schemas already say; without the flag the
 generator reads the default as a promise and makes it required in both.
+
+## The health panel
+
+The panel on a project page reads two endpoints for the chosen environment:
+totals and a minute-by-minute series from `/metrics`, and a verdict with ranked
+remediation steps from `/analysis`.
+
+It does not re-sort the steps. They arrive in the order the control plane ranked
+them, computed from measured traffic, and the figure each was ranked by is shown
+beside it so the order is not something the reader has to take on trust. The
+window is asked for only on the metrics call: the report is a comparison, and a
+dashboard picking the period it compares over would be choosing how sensitive
+the answer is without saying so anywhere a reader would see it.
 
 ## Signing in
 
