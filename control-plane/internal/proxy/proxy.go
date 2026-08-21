@@ -26,9 +26,16 @@ type Resolver interface {
 	ResolveUpstream(ctx context.Context, subdomain string) (domain.Upstream, error)
 }
 
+// Recorder receives one observation per proxied request. It is optional: a
+// proxy running without one still routes, it is simply not measured.
+type Recorder interface {
+	Observe(deploymentID, environmentID string, status int, latency time.Duration)
+}
+
 // Proxy forwards requests to deployed workloads.
 type Proxy struct {
 	Resolver Resolver
+	Recorder Recorder
 	Log      *slog.Logger
 	// BaseDomain is the suffix stripped from a Host header to recover the
 	// environment's subdomain, e.g. "localhost" or "launchpad.dev".
@@ -64,7 +71,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, err := p.upstreamFor(r.Context(), subdomain)
+	route, err := p.upstreamFor(r.Context(), subdomain)
 	switch {
 	case errors.Is(err, domain.ErrNotFound):
 		http.Error(w, "no such environment", http.StatusNotFound)
@@ -84,8 +91,48 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target.ServeHTTP(w, r)
+	// Measured here rather than inside the reverse proxy, so the number covers
+	// what the client experienced: the time to the last byte of the response,
+	// including a body the workload was slow to finish writing.
+	started := time.Now()
+	recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	route.proxy.ServeHTTP(recorder, r)
+
+	if p.Recorder != nil {
+		p.Recorder.Observe(route.upstream.DeploymentID, route.upstream.EnvironmentID,
+			recorder.status, time.Since(started))
+	}
 }
+
+// statusRecorder remembers the status the upstream answered with, which is how
+// a failure is told from a success after the fact.
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (s *statusRecorder) WriteHeader(status int) {
+	if s.wroteHeader {
+		return
+	}
+	s.status = status
+	s.wroteHeader = true
+	s.ResponseWriter.WriteHeader(status)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if !s.wroteHeader {
+		s.WriteHeader(http.StatusOK)
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+// Unwrap is what keeps this wrapper from breaking the two things a proxy has to
+// support beyond plain requests: http.ResponseController reaches the real
+// writer through it, so flushing a streamed response and hijacking a connection
+// for a protocol upgrade both still work.
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 // subdomainFor extracts the environment label from a Host header.
 func (p *Proxy) subdomainFor(host string) (string, bool) {
@@ -112,26 +159,27 @@ func (p *Proxy) subdomainFor(host string) (string, bool) {
 	return subdomain, true
 }
 
-// upstreamFor returns a reverse proxy for a subdomain, reusing a cached one
-// while it is fresh. Resolving on every request would put a database query in
-// front of every byte of proxied traffic.
-func (p *Proxy) upstreamFor(ctx context.Context, subdomain string) (*httputil.ReverseProxy, error) {
+// upstreamFor returns the route for a subdomain — the reverse proxy and the
+// deployment behind it — reusing a cached one while it is fresh. Resolving on
+// every request would put a database query in front of every byte of proxied
+// traffic.
+func (p *Proxy) upstreamFor(ctx context.Context, subdomain string) (cacheEntry, error) {
 	p.mu.RLock()
 	entry, found := p.cache[subdomain]
 	p.mu.RUnlock()
 
 	if found && time.Now().Before(entry.expires) {
-		return entry.proxy, nil
+		return entry, nil
 	}
 
 	upstream, err := p.Resolver.ResolveUpstream(ctx, subdomain)
 	if err != nil {
-		return nil, err
+		return cacheEntry{}, err
 	}
 
 	target, err := url.Parse(upstream.URL)
 	if err != nil {
-		return nil, err
+		return cacheEntry{}, err
 	}
 
 	reverse := httputil.NewSingleHostReverseProxy(target)
@@ -154,18 +202,20 @@ func (p *Proxy) upstreamFor(ctx context.Context, subdomain string) (*httputil.Re
 		return nil
 	}
 
-	p.mu.Lock()
-	if p.cache == nil {
-		p.cache = make(map[string]cacheEntry)
-	}
-	p.cache[subdomain] = cacheEntry{
+	route := cacheEntry{
 		upstream: upstream,
 		proxy:    reverse,
 		expires:  time.Now().Add(p.ttl()),
 	}
+
+	p.mu.Lock()
+	if p.cache == nil {
+		p.cache = make(map[string]cacheEntry)
+	}
+	p.cache[subdomain] = route
 	p.mu.Unlock()
 
-	return reverse, nil
+	return route, nil
 }
 
 // Invalidate drops a cached route, so a freshly released deployment takes

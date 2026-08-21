@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -239,5 +240,174 @@ func TestProxyDoesNotCacheFailures(t *testing.T) {
 
 	if got := resolver.calls.Load(); got != 3 {
 		t.Errorf("resolver called %d times, want 3: a failed lookup must not be cached", got)
+	}
+}
+
+// recordingRecorder captures the observations the proxy makes.
+type recordingRecorder struct {
+	mu           sync.Mutex
+	observations []observation
+}
+
+type observation struct {
+	deploymentID  string
+	environmentID string
+	status        int
+	latency       time.Duration
+}
+
+func (r *recordingRecorder) Observe(deploymentID, environmentID string, status int, latency time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.observations = append(r.observations, observation{deploymentID, environmentID, status, latency})
+}
+
+func (r *recordingRecorder) all() []observation {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]observation(nil), r.observations...)
+}
+
+func TestProxyMeasuresWhatItServes(t *testing.T) {
+	const delay = 15 * time.Millisecond
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(delay)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer backend.Close()
+
+	resolver := &stubResolver{upstreams: map[string]domain.Upstream{
+		"demo": {EnvironmentID: "env-1", DeploymentID: "deploy-1", URL: backend.URL},
+	}}
+	recorder := &recordingRecorder{}
+
+	p := newProxy(resolver, "localhost")
+	p.Recorder = recorder
+
+	req := httptest.NewRequest(http.MethodGet, "http://demo.localhost/", nil)
+	req.Host = "demo.localhost"
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	got := recorder.all()
+	if len(got) != 1 {
+		t.Fatalf("recorded %d observations, want 1", len(got))
+	}
+	// Attributed to the deployment that answered, which is what lets a
+	// regression be pinned to a release.
+	if got[0].deploymentID != "deploy-1" || got[0].environmentID != "env-1" {
+		t.Errorf("attributed to %s/%s, want deploy-1/env-1", got[0].deploymentID, got[0].environmentID)
+	}
+	if got[0].status != http.StatusOK {
+		t.Errorf("status = %d, want 200", got[0].status)
+	}
+	// Measured around the whole exchange, so a slow response is recorded as
+	// slow rather than as the time it took to start answering.
+	if got[0].latency < delay {
+		t.Errorf("latency = %v, want at least the %v the backend spent", got[0].latency, delay)
+	}
+}
+
+// TestProxyMeasuresAnUnreachableWorkload is the reliability half: a container
+// that has stopped listening is exactly the case an agent inside that container
+// could not report.
+func TestProxyMeasuresAnUnreachableWorkload(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+
+	resolver := &stubResolver{upstreams: map[string]domain.Upstream{
+		"demo": {EnvironmentID: "env-1", DeploymentID: "deploy-1", URL: deadURL},
+	}}
+	recorder := &recordingRecorder{}
+
+	p := newProxy(resolver, "localhost")
+	p.Recorder = recorder
+
+	req := httptest.NewRequest(http.MethodGet, "http://demo.localhost/", nil)
+	req.Host = "demo.localhost"
+	p.ServeHTTP(httptest.NewRecorder(), req)
+
+	got := recorder.all()
+	if len(got) != 1 {
+		t.Fatalf("recorded %d observations, want 1", len(got))
+	}
+	if got[0].status != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502 so the failure is counted against the deployment", got[0].status)
+	}
+}
+
+// TestProxyRecordsNothingItCannotAttribute keeps the failure rate honest: a
+// request for a hostname nobody minted belongs to no deployment, and counting
+// it against one would make an environment look broken because of a typo
+// somewhere else.
+func TestProxyRecordsNothingItCannotAttribute(t *testing.T) {
+	recorder := &recordingRecorder{}
+	p := newProxy(&stubResolver{upstreams: map[string]domain.Upstream{}}, "localhost")
+	p.Recorder = recorder
+
+	for _, host := range []string{"localhost", "nobody-minted-this.localhost"} {
+		req := httptest.NewRequest(http.MethodGet, "http://"+host+"/", nil)
+		req.Host = host
+		p.ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	if got := recorder.all(); len(got) != 0 {
+		t.Errorf("recorded %d observations for unroutable requests, want none: %+v", len(got), got)
+	}
+}
+
+// TestProxyStreamsThroughTheRecorder guards the wrapper around the response
+// writer. Wrapping it hides the flusher the reverse proxy reaches for, so a
+// streamed response would arrive all at once at the end — or not at all.
+func TestProxyStreamsThroughTheRecorder(t *testing.T) {
+	released := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "first\n")
+		http.NewResponseController(w).Flush()
+		<-released
+		_, _ = io.WriteString(w, "second\n")
+	}))
+	defer backend.Close()
+
+	resolver := &stubResolver{upstreams: map[string]domain.Upstream{
+		"demo": {EnvironmentID: "env-1", DeploymentID: "deploy-1", URL: backend.URL},
+	}}
+	p := newProxy(resolver, "localhost")
+	p.Recorder = &recordingRecorder{}
+
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Host = "demo.localhost"
+
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// The first line has to arrive while the handler is still holding the
+	// second one back.
+	line := make([]byte, 6)
+	if _, err := io.ReadFull(resp.Body, line); err != nil {
+		t.Fatalf("read the flushed line: %v", err)
+	}
+	if string(line) != "first\n" {
+		t.Errorf("read %q, want the flushed first line", line)
+	}
+
+	close(released)
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read the rest: %v", err)
+	}
+	if string(rest) != "second\n" {
+		t.Errorf("read %q after releasing the handler, want \"second\\n\"", rest)
 	}
 }
