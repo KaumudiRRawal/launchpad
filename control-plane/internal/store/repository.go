@@ -221,6 +221,26 @@ func (r *Repository) CreateEnvironment(ctx context.Context, accountID, projectID
 	return e, nil
 }
 
+// GetEnvironment scopes the lookup to accountID for the same reason
+// GetProject does: an environment belonging to someone else is reported as not
+// found rather than forbidden, so a caller cannot use the difference to
+// discover that an ID exists.
+func (r *Repository) GetEnvironment(ctx context.Context, accountID, id string) (domain.Environment, error) {
+	const query = `
+		SELECT e.id, e.project_id, e.kind, e.name, e.subdomain, e.created_at, e.updated_at
+		FROM environments e
+		JOIN projects p ON p.id = e.project_id
+		WHERE e.id = $1 AND p.account_id = $2`
+
+	var e domain.Environment
+	err := r.pool.QueryRow(ctx, query, id, accountID).
+		Scan(&e.ID, &e.ProjectID, &e.Kind, &e.Name, &e.Subdomain, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		return domain.Environment{}, fmt.Errorf("get environment: %w", translate(err))
+	}
+	return e, nil
+}
+
 func (r *Repository) ListEnvironments(ctx context.Context, accountID, projectID string) ([]domain.Environment, error) {
 	const query = `
 		SELECT e.id, e.project_id, e.kind, e.name, e.subdomain, e.created_at, e.updated_at
