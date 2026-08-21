@@ -20,9 +20,8 @@ platform collapses that into one API call and one dashboard button.
 - **Typed service contracts.** The API is specified once and the dashboard's
   client is generated from that spec, so a backend change that breaks the
   frontend fails at compile time instead of in the browser.
-- **Latency and reliability analysis.** Deployed applications are measured
-  continuously, and regressions are surfaced as a ranked list of what to fix
-  first.
+- **Latency and reliability analysis.** Every request through the platform is
+  measured, and regressions are surfaced as a ranked list of what to fix first.
 
 ## Architecture
 
@@ -103,6 +102,9 @@ configure.
 `dashboard/` is a React + TypeScript single-page app. It lists and creates
 projects, adds services and environments, triggers a deployment, and follows the
 build log line by line until the deployment reaches a state it will not leave.
+Each project also carries a health panel: an environment's latency and
+availability, the minutes behind them, and the remediation steps the control
+plane ranked, in that order.
 
 The dev server proxies `/v1` to the control plane, so the browser talks to one
 origin and the API carries no CORS headers. See `dashboard/README.md`.
@@ -128,6 +130,8 @@ dashboard's TypeScript types are generated from it with `make api-client`.
 | `POST` | `/v1/projects/{id}/environments` | Create a preview or production environment |
 | `GET` | `/v1/projects/{id}/environments` | List environments |
 | `GET` | `/v1/projects/{id}/deployments` | Deployment history |
+| `GET` | `/v1/environments/{id}/metrics` | Latency and reliability, `?window=1h` |
+| `GET` | `/v1/environments/{id}/analysis` | Regressions and what to do first |
 | `POST` | `/v1/deployments` | Trigger a deployment |
 | `GET` | `/v1/deployments/{id}` | Deployment status |
 | `GET` | `/v1/deployments/{id}/logs` | Build logs, `?after=N` to resume |
@@ -254,6 +258,48 @@ An environment that exists but has nothing serving yet answers `503` with
 `Retry-After`, not `404`. A hostname nobody has deployed to and a hostname that
 was never minted deserve different answers.
 
+**Measurement happens at the proxy, not in the application.** Every request to
+a deployed workload already passes through the platform's proxy, so that is
+where latency and reliability are recorded. Nothing has to be installed in the
+deployed application, and a workload that has stopped answering is measured by
+the same code that measured it while it was healthy — an agent inside the
+container would go quiet at exactly the moment its numbers mattered. A request
+that never resolves to a deployment is not recorded against one, so a typo in a
+hostname cannot make an environment look broken.
+
+**Latency is stored as a distribution, not as a percentile.** Each minute of
+each deployment's traffic becomes one row holding counts against a fixed set of
+latency buckets. Percentiles are interpolated from the buckets when a window is
+read, because percentiles do not add up: the mean of two minutes' p95 is not
+the p95 of the two minutes together, but the sum of their histograms is exactly
+the distribution of both. Two replicas flushing the same minute accumulate
+into one row rather than overwriting each other, which is what the
+`histogram_add` function in the schema exists for.
+
+A percentile is capped at the largest request actually observed, which is
+recorded exactly alongside the histogram. Interpolating inside a wide bucket
+can otherwise put the 99th percentile above anything that happened, and a
+number nobody can act on is worse than a coarser one.
+
+**The analysis ranks remediations by measured cost, not by predicted benefit.**
+Each finding carries the traffic it affects, in requests per hour, derived from
+the window's own latency distribution — for a latency regression, how many
+requests are now slower than the baseline's p95 beyond the share that always
+would be. Steps inherit that figure and are ordered by it. It is deliberately
+not an estimate of how well the fix will work: the platform can measure how
+much traffic a problem affects, and cannot see the future. Where two steps
+answer one finding, removing the cause comes before going to look for it.
+
+**A window too quiet to judge is reported as such, never as healthy.** Below
+twenty requests a 95th percentile is one or two observations, so the report says
+`insufficient_data` and explains why. An environment nobody has called has not
+been shown to work. For the same reason a regression is only claimed when both
+windows hold enough traffic to be compared, and every threshold in the analysis
+exists to keep one specific false positive out of the report: a ratio guard so
+4ms → 6ms is not "a fifty per cent regression", an absolute floor so a service
+that was already slow is not exempt, and an absolute failure-rate check so an
+environment that was broken before the baseline began is still reported broken.
+
 **API keys are stored only as hashes.** A leaked database dump yields no usable
 credential. A plain SHA-256 is right here where it would be wrong for a
 password: the token is 256 bits of uniform randomness, so there is no
@@ -274,7 +320,9 @@ Built in public over seven days. Each day is a working increment.
 - [x] **Day 5** — Preview environments, subdomain routing, typed contracts:
       an OpenAPI 3 specification the tests hold the code to, and the
       dashboard's types generated from it
-- [ ] **Day 6** — Latency and reliability analysis
+- [x] **Day 6** — Latency and reliability: measured at the proxy, stored as
+      distributions, compared against a baseline, and turned into a ranked list
+      of what to fix first
 - [ ] **Day 7** — Terraform modules, Cloud Run driver, documentation
 
 ## License
