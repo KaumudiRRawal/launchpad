@@ -39,6 +39,10 @@ tags:
     description: An environment is an isolation boundary with its own hostname.
   - name: deployments
     description: One service, built at one commit, released into one environment.
+  - name: measurement
+    description: |
+      What a deployed application actually did: how fast it answered, how often
+      it failed, and whether either has got worse.
   - name: api-keys
     description: Credentials for this account.
 
@@ -295,6 +299,101 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /v1/environments/{environmentID}/metrics:
+    get:
+      operationId: getEnvironmentMetrics
+      tags: [measurement]
+      summary: Latency and reliability for one environment
+      description: |
+        Measured at the proxy, because every request to a deployed workload
+        already passes through it: nothing has to be installed in the
+        application, and a workload that has stopped answering is measured by
+        the same code that measured it while it was healthy. An agent inside the
+        container would go quiet at exactly the moment its numbers mattered.
+
+        Percentiles are interpolated from the stored latency distribution rather
+        than averaged from per-minute percentiles, because the mean of two p95s
+        is not the p95 of anything.
+      parameters:
+        - $ref: "#/components/parameters/EnvironmentID"
+        - name: window
+          in: query
+          required: false
+          description: |
+            How far back to look, as a duration such as `15m` or `6h`. Bounded
+            at both ends: below a minute there are too few requests for a
+            percentile to describe anything, and above a day the response holds
+            more minutes than a caller can use.
+          schema:
+            type: string
+            default: 1h
+      responses:
+        "200":
+          description: The window's totals and the minutes behind them.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvironmentMetrics"
+        "400":
+          description: The `window` parameter is not a duration in range.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/environments/{environmentID}/analysis:
+    get:
+      operationId: getEnvironmentAnalysis
+      tags: [measurement]
+      summary: What has got worse, and what to do about it
+      description: |
+        Compares the most recent window against the period before it — four
+        times as long, so one slow minute cannot move the thing being compared
+        against — and reports the regressions with the evidence for each.
+
+        Every number is derived from observations the proxy made. That includes
+        the figure the remediation steps are ranked by: it is the measured cost
+        of the problem in requests per hour, not a prediction of how well the
+        step will work. The platform can see how much traffic a regression
+        affects; it cannot see the future.
+
+        A window with too little traffic to judge is reported as
+        `insufficient_data` rather than as healthy. An environment nobody called
+        has not been shown to work.
+      parameters:
+        - $ref: "#/components/parameters/EnvironmentID"
+        - name: window
+          in: query
+          required: false
+          description: |
+            The recent period to judge, as a duration such as `15m`. The
+            baseline reaches four times further back, so the ceiling here is
+            lower than on the metrics endpoint.
+          schema:
+            type: string
+            default: 15m
+      responses:
+        "200":
+          description: The report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnalysisReport"
+        "400":
+          description: The `window` parameter is not a duration in range.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /v1/projects/{projectID}/deployments:
     get:
       operationId: listDeployments
@@ -504,6 +603,13 @@ components:
         format: uuid
     DeploymentID:
       name: deploymentID
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    EnvironmentID:
+      name: environmentID
       in: path
       required: true
       schema:
@@ -738,6 +844,197 @@ components:
         logged_at:
           type: string
           format: date-time
+
+    Severity:
+      type: string
+      description: |
+        How much a finding deserves attention. There is no informational level
+        on purpose: a finding the report will not ask anyone to act on is noise,
+        and a report full of noise stops being read.
+      enum: [warning, critical]
+
+    Verdict:
+      type: string
+      description: |
+        The whole report in one word. `insufficient_data` is deliberately not
+        `healthy` — an environment nobody called has not been shown to work.
+      enum: [insufficient_data, healthy, degraded, failing]
+
+    MetricSummary:
+      type: object
+      required:
+        [requests, failures, availability, latency_avg_ms, latency_p50_ms,
+         latency_p95_ms, latency_p99_ms, latency_max_ms]
+      properties:
+        requests:
+          type: integer
+        failures:
+          type: integer
+          description: |
+            Requests answered with a 5xx, the proxy's own 502 for an
+            unreachable workload included. A 404 the application chose to
+            return is its own business and says nothing about its health.
+        availability:
+          type: number
+          description: |
+            The fraction of requests that did not fail, and 1 when there was no
+            traffic at all.
+        latency_avg_ms:
+          type: number
+        latency_p50_ms:
+          type: number
+        latency_p95_ms:
+          type: number
+        latency_p99_ms:
+          type: number
+        latency_max_ms:
+          type: number
+          description: |
+            Recorded exactly rather than read off the histogram, so the worst
+            request in a window is reported as what it was even where the
+            percentiles have saturated at the largest bucket.
+
+    MetricWindow:
+      type: object
+      required: [from, to, summary]
+      properties:
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        summary:
+          $ref: "#/components/schemas/MetricSummary"
+
+    MetricPoint:
+      type: object
+      required: [bucket, requests, failures, latency_p95_ms]
+      properties:
+        bucket:
+          type: string
+          format: date-time
+          description: The start of the minute, not the end.
+        requests:
+          type: integer
+        failures:
+          type: integer
+        latency_p95_ms:
+          type: number
+
+    EnvironmentMetrics:
+      type: object
+      required: [environment_id, window, series]
+      properties:
+        environment_id:
+          type: string
+          format: uuid
+        window:
+          $ref: "#/components/schemas/MetricWindow"
+        series:
+          type: array
+          description: |
+            One point per minute, across every deployment that served the
+            environment. A release in the middle of a window does not break the
+            line: traffic is continuous even though the deployment behind it is
+            not.
+          items:
+            $ref: "#/components/schemas/MetricPoint"
+
+    Finding:
+      type: object
+      required:
+        [code, severity, summary, detail, metric, baseline_value, current_value,
+         affected_requests_per_hour]
+      properties:
+        code:
+          type: string
+          description: |
+            A stable identifier a client can branch on. The prose beside it may
+            be reworded.
+          enum:
+            [latency_regression, reliability_regression, elevated_failure_rate,
+             latency_tail_spread]
+        severity:
+          $ref: "#/components/schemas/Severity"
+        summary:
+          type: string
+        detail:
+          type: string
+        metric:
+          type: string
+          description: |
+            Which field of MetricSummary the two values below were taken from,
+            so a client can point at a number it is already showing.
+        baseline_value:
+          type: number
+        current_value:
+          type: number
+        affected_requests_per_hour:
+          type: number
+          description: |
+            How much traffic this finding costs, measured from the window's own
+            latency distribution and scaled to an hour so findings from windows
+            of different lengths can be compared.
+
+    Remediation:
+      type: object
+      required: [action, summary, detail, finding, affected_requests_per_hour]
+      properties:
+        action:
+          type: string
+          description: A stable identifier for the kind of step.
+          enum:
+            [roll_back_deployment, profile_the_request_path,
+             inspect_failing_requests, investigate_the_slow_path]
+        summary:
+          type: string
+        detail:
+          type: string
+        finding:
+          type: string
+          description: The code of the finding this step answers.
+        affected_requests_per_hour:
+          type: number
+          description: |
+            Inherited from that finding, and what orders this list. It is what
+            the step stands to recover if it works, not a claim that it will:
+            the platform can measure how much traffic a problem affects and
+            cannot measure how good a fix will be.
+
+    AnalysisReport:
+      type: object
+      required:
+        [environment_id, generated_at, verdict, detail, baseline, current,
+         findings, remediations]
+      properties:
+        environment_id:
+          type: string
+          format: uuid
+        generated_at:
+          type: string
+          format: date-time
+        verdict:
+          $ref: "#/components/schemas/Verdict"
+        detail:
+          type: string
+          description: |
+            The verdict in one sentence, including why a report says nothing
+            when it says nothing.
+        baseline:
+          $ref: "#/components/schemas/MetricWindow"
+        current:
+          $ref: "#/components/schemas/MetricWindow"
+        findings:
+          type: array
+          description: The evidence, worst first.
+          items:
+            $ref: "#/components/schemas/Finding"
+        remediations:
+          type: array
+          description: The steps, in the order they are worth taking.
+          items:
+            $ref: "#/components/schemas/Remediation"
 
     APIKey:
       type: object

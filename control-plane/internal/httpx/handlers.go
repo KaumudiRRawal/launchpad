@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 
+	"github.com/KaumudiRRawal/launchpad/control-plane/internal/analyze"
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/domain"
+	"github.com/KaumudiRRawal/launchpad/control-plane/internal/metrics"
 )
 
 // Store is the slice of the repository the HTTP layer uses. Declaring it here,
@@ -26,6 +30,8 @@ type Store interface {
 
 	CreateEnvironment(ctx context.Context, accountID, projectID string, in domain.CreateEnvironmentInput, subdomain string) (domain.Environment, error)
 	ListEnvironments(ctx context.Context, accountID, projectID string) ([]domain.Environment, error)
+	GetEnvironment(ctx context.Context, accountID, id string) (domain.Environment, error)
+	EnvironmentMetrics(ctx context.Context, accountID, environmentID string, since time.Time) ([]domain.MetricBucket, error)
 
 	CreateDeployment(ctx context.Context, accountID string, in domain.CreateDeploymentInput) (domain.Deployment, error)
 	GetDeployment(ctx context.Context, accountID, id string) (domain.Deployment, error)
@@ -323,6 +329,110 @@ func (a *API) handleDeploymentLogs(w http.ResponseWriter, r *http.Request) {
 		"logs":       logs,
 		"next_after": nextAfter,
 	})
+}
+
+// --- Measurement ---
+
+// The two measurement endpoints answer different questions from the same rows.
+// Metrics say what happened; the analysis says whether it is worse than it was
+// and what to do about it. They are separate because a dashboard drawing a
+// chart every few seconds should not pay for a comparison it is not showing,
+// and a report is worth asking for on demand.
+
+// windowParam reads the `window` query parameter, a duration such as "15m" or
+// "6h". It is bounded at both ends: below the lower bound there are too few
+// requests for a percentile to describe anything, and above the upper one the
+// query reads more minutes than a caller can use.
+func windowParam(w http.ResponseWriter, r *http.Request, def, low, high time.Duration) (time.Duration, bool) {
+	raw := r.URL.Query().Get("window")
+	if raw == "" {
+		return def, true
+	}
+
+	parsed, err := time.ParseDuration(raw)
+	if err != nil || parsed < low || parsed > high {
+		Error(w, r, http.StatusBadRequest, "invalid_parameter",
+			fmt.Sprintf("window must be a duration between %s and %s, such as %q", low, high, def))
+		return 0, false
+	}
+	return parsed, true
+}
+
+// environmentFor resolves the path's environment, writing the error response
+// itself. It is fetched before any measurement so that an environment which
+// does not exist answers 404 rather than an empty series, which a caller would
+// read as "no traffic".
+func (a *API) environmentFor(w http.ResponseWriter, r *http.Request) (domain.Environment, bool) {
+	account := MustAccountFrom(r.Context())
+
+	environment, err := a.Store.GetEnvironment(r.Context(), account.ID, r.PathValue("environmentID"))
+	if err != nil {
+		writeStoreError(w, r, err, "environment not found")
+		return domain.Environment{}, false
+	}
+	return environment, true
+}
+
+func (a *API) handleEnvironmentMetrics(w http.ResponseWriter, r *http.Request) {
+	window, ok := windowParam(w, r, time.Hour, time.Minute, 24*time.Hour)
+	if !ok {
+		return
+	}
+
+	environment, ok := a.environmentFor(w, r)
+	if !ok {
+		return
+	}
+
+	account := MustAccountFrom(r.Context())
+	now := time.Now().UTC()
+
+	buckets, err := a.Store.EnvironmentMetrics(r.Context(), account.ID, environment.ID, now.Add(-window))
+	if err != nil {
+		writeStoreError(w, r, err, "environment not found")
+		return
+	}
+
+	summary, _ := metrics.Summarize(buckets)
+	JSON(w, r, http.StatusOK, domain.EnvironmentMetrics{
+		EnvironmentID: environment.ID,
+		Window:        domain.MetricWindow{From: now.Add(-window), To: now, Summary: summary},
+		Series:        metrics.Series(buckets),
+	})
+}
+
+func (a *API) handleEnvironmentAnalysis(w http.ResponseWriter, r *http.Request) {
+	// A shorter ceiling than the metrics endpoint: the comparison reaches
+	// several times further back than the window it is given, so a six-hour
+	// window is already a day and a half of rows.
+	window, ok := windowParam(w, r, analyze.DefaultWindow, time.Minute, 6*time.Hour)
+	if !ok {
+		return
+	}
+
+	environment, ok := a.environmentFor(w, r)
+	if !ok {
+		return
+	}
+
+	account := MustAccountFrom(r.Context())
+	now := time.Now().UTC()
+	baseline := analyze.BaselineFor(window)
+
+	buckets, err := a.Store.EnvironmentMetrics(r.Context(), account.ID, environment.ID,
+		now.Add(-(window + baseline)))
+	if err != nil {
+		writeStoreError(w, r, err, "environment not found")
+		return
+	}
+
+	JSON(w, r, http.StatusOK, analyze.Analyze(analyze.Input{
+		EnvironmentID: environment.ID,
+		Now:           now,
+		Window:        window,
+		Baseline:      baseline,
+		Buckets:       buckets,
+	}))
 }
 
 // --- API keys ---

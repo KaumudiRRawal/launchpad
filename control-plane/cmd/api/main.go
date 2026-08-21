@@ -18,6 +18,7 @@ import (
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/config"
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/deploy"
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/httpx"
+	"github.com/KaumudiRRawal/launchpad/control-plane/internal/metrics"
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/proxy"
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/store"
 	"github.com/KaumudiRRawal/launchpad/control-plane/migrations"
@@ -70,8 +71,18 @@ func run() error {
 		ProxyPort:  cfg.ProxyPort(),
 	}
 
+	// Every request to a deployed workload passes through the proxy, so that is
+	// where latency and reliability are measured. Nothing has to be installed
+	// in the deployed application, and a workload that has stopped answering is
+	// measured by the same code that measured it while it was healthy.
+	collector := &metrics.Collector{
+		Sink: repo,
+		Log:  log.With(slog.String("component", "metrics")),
+	}
+
 	router := &proxy.Proxy{
 		Resolver:   repo,
+		Recorder:   collector,
 		Log:        log.With(slog.String("component", "proxy")),
 		BaseDomain: cfg.BaseDomain,
 	}
@@ -83,11 +94,20 @@ func run() error {
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}
 
+	// Drained with the deploy workers below, because its last act is to flush
+	// the minute in progress: exiting first would leave a hole in the
+	// measurements immediately before every restart.
+	var workers sync.WaitGroup
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		collector.Run(ctx)
+	}()
+
 	// The deploy workers run in-process. Splitting them into a separate
 	// service would buy independent scaling that a platform this size does not
 	// need yet, at the cost of a second deployable to operate. The claim query
 	// takes a row lock, so running several workers here is already safe.
-	var workers sync.WaitGroup
 	for i := range cfg.DeployWorkers {
 		engine := &deploy.Engine{
 			Store:       repo,
@@ -162,7 +182,7 @@ func run() error {
 	// The workers observe the same cancelled context; waiting lets an
 	// in-flight deployment finish recording its outcome rather than being
 	// abandoned mid-build with its status stuck at building.
-	log.Info("waiting for deploy workers to drain")
+	log.Info("waiting for background workers to drain")
 	workers.Wait()
 
 	log.Info("shutdown complete")

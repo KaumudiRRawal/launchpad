@@ -11,8 +11,11 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/KaumudiRRawal/launchpad/control-plane/internal/analyze"
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/domain"
+	"github.com/KaumudiRRawal/launchpad/control-plane/internal/metrics"
 )
 
 const (
@@ -25,6 +28,8 @@ const (
 // exercise real decisions rather than a mock that always succeeds.
 type fakeStore struct {
 	projects       []domain.Project
+	environments   []domain.Environment
+	metricBuckets  []domain.MetricBucket
 	deploymentLogs []domain.DeploymentLog
 	nextID         int
 
@@ -118,11 +123,54 @@ func (f *fakeStore) ListServices(context.Context, string, string) ([]domain.Serv
 }
 
 func (f *fakeStore) CreateEnvironment(_ context.Context, _, projectID string, in domain.CreateEnvironmentInput, subdomain string) (domain.Environment, error) {
-	return domain.Environment{ID: "env-1", ProjectID: projectID, Kind: in.Kind, Name: in.Name, Subdomain: subdomain}, nil
+	e := domain.Environment{ID: "env-1", ProjectID: projectID, Kind: in.Kind, Name: in.Name, Subdomain: subdomain}
+	f.environments = append(f.environments, e)
+	return e, nil
 }
 
 func (f *fakeStore) ListEnvironments(context.Context, string, string) ([]domain.Environment, error) {
 	return []domain.Environment{}, nil
+}
+
+// owns mirrors what the real queries do in SQL: reach the environment through
+// the project, so one account's ID never resolves another account's row.
+func (f *fakeStore) owns(accountID, environmentID string) bool {
+	for _, e := range f.environments {
+		if e.ID != environmentID {
+			continue
+		}
+		for _, p := range f.projects {
+			if p.ID == e.ProjectID && p.AccountID == accountID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (f *fakeStore) GetEnvironment(_ context.Context, accountID, id string) (domain.Environment, error) {
+	if !f.owns(accountID, id) {
+		return domain.Environment{}, domain.ErrNotFound
+	}
+	for _, e := range f.environments {
+		if e.ID == id {
+			return e, nil
+		}
+	}
+	return domain.Environment{}, domain.ErrNotFound
+}
+
+func (f *fakeStore) EnvironmentMetrics(_ context.Context, accountID, environmentID string, since time.Time) ([]domain.MetricBucket, error) {
+	if !f.owns(accountID, environmentID) {
+		return nil, domain.ErrNotFound
+	}
+	out := []domain.MetricBucket{}
+	for _, b := range f.metricBuckets {
+		if b.EnvironmentID == environmentID && !b.Bucket.Before(since) {
+			out = append(out, b)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeStore) CreateDeployment(_ context.Context, _ string, in domain.CreateDeploymentInput) (domain.Deployment, error) {
@@ -517,5 +565,203 @@ func TestDeploymentLogsRejectsBadCursor(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("after=%q: status = %d, want 400", cursor, rec.Code)
 		}
+	}
+}
+
+// seedEnvironment gives the fake store an environment the test account owns,
+// reached through a project exactly as the real queries reach it.
+func seedEnvironment(f *fakeStore) domain.Environment {
+	project := domain.Project{ID: "project-metrics", AccountID: testAccountID, Slug: "demo", Name: "Demo"}
+	f.projects = append(f.projects, project)
+
+	environment := domain.Environment{
+		ID: "env-metrics", ProjectID: project.ID,
+		Kind: domain.EnvironmentProduction, Name: "production", Subdomain: "production-demo",
+	}
+	f.environments = append(f.environments, environment)
+	return environment
+}
+
+// seedTraffic adds one minute of measurements, `minutesAgo` minutes back.
+func seedTraffic(f *fakeStore, environmentID string, minutesAgo int, requests, failures int, latencyMS float64) {
+	histogram := metrics.NewHistogram()
+	for range requests {
+		histogram.Observe(latencyMS)
+	}
+
+	f.metricBuckets = append(f.metricBuckets, domain.MetricBucket{
+		DeploymentID:  "deploy-1",
+		EnvironmentID: environmentID,
+		CommitSHA:     strings.Repeat("a", 40),
+		Bucket:        time.Now().UTC().Add(-time.Duration(minutesAgo) * time.Minute).Truncate(time.Minute),
+		Requests:      int64(requests),
+		Failures:      int64(failures),
+		LatencySumMS:  latencyMS * float64(requests),
+		LatencyMaxMS:  latencyMS,
+		Histogram:     histogram,
+	})
+}
+
+func TestEnvironmentMetricsSummarisesTheWindow(t *testing.T) {
+	store := newFakeStore()
+	environment := seedEnvironment(store)
+	seedTraffic(store, environment.ID, 2, 100, 1, 30)
+	seedTraffic(store, environment.ID, 1, 100, 1, 30)
+	// Outside a one-hour window, so it must not reach the summary.
+	seedTraffic(store, environment.ID, 200, 500, 400, 4000)
+
+	srv := newAPI(store)
+	rec := request(t, srv, http.MethodGet, "/v1/environments/"+environment.ID+"/metrics", testToken, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body)
+	}
+
+	var body domain.EnvironmentMetrics
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if body.EnvironmentID != environment.ID {
+		t.Errorf("environment_id = %q, want %q", body.EnvironmentID, environment.ID)
+	}
+	if body.Window.Summary.Requests != 200 || body.Window.Summary.Failures != 2 {
+		t.Errorf("summary = %d requests / %d failures, want 200/2 — the older minute leaked in",
+			body.Window.Summary.Requests, body.Window.Summary.Failures)
+	}
+	if got := body.Window.Summary.Availability; got < 0.98 || got > 0.99 {
+		t.Errorf("Availability = %v, want 0.99", got)
+	}
+	if got := body.Window.Summary.LatencyP95MS; got < 20 || got > 30 {
+		t.Errorf("LatencyP95MS = %v, want it inside the 20–30ms bucket the traffic was in", got)
+	}
+	if len(body.Series) != 2 {
+		t.Errorf("series holds %d points, want 2", len(body.Series))
+	}
+}
+
+func TestEnvironmentMetricsOfAQuietEnvironment(t *testing.T) {
+	store := newFakeStore()
+	environment := seedEnvironment(store)
+
+	srv := newAPI(store)
+	rec := request(t, srv, http.MethodGet, "/v1/environments/"+environment.ID+"/metrics", testToken, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body)
+	}
+
+	// An environment with no traffic is a 200 with nothing in it, not a 404:
+	// the environment exists, and "nobody has called it" is the answer.
+	if !strings.Contains(rec.Body.String(), `"series":[]`) {
+		t.Errorf("body = %s, want an empty series rather than null", rec.Body)
+	}
+}
+
+func TestMeasurementIsScopedToTheOwner(t *testing.T) {
+	store := newFakeStore()
+	// An environment under a project belonging to somebody else. It has to be
+	// indistinguishable from one that does not exist.
+	store.projects = append(store.projects, domain.Project{ID: "project-theirs", AccountID: "account-2"})
+	store.environments = append(store.environments,
+		domain.Environment{ID: "env-theirs", ProjectID: "project-theirs"})
+
+	srv := newAPI(store)
+	for _, path := range []string{
+		"/v1/environments/env-theirs/metrics",
+		"/v1/environments/env-theirs/analysis",
+		"/v1/environments/does-not-exist/metrics",
+		"/v1/environments/does-not-exist/analysis",
+	} {
+		t.Run(path, func(t *testing.T) {
+			rec := request(t, srv, http.MethodGet, path, testToken, nil)
+			if rec.Code != http.StatusNotFound {
+				t.Errorf("status = %d, want 404 (body: %s)", rec.Code, rec.Body)
+			}
+		})
+	}
+}
+
+func TestWindowParameterIsBounded(t *testing.T) {
+	store := newFakeStore()
+	environment := seedEnvironment(store)
+	srv := newAPI(store)
+
+	tests := []struct {
+		name       string
+		query      string
+		wantStatus int
+	}{
+		{name: "absent uses the default", query: "", wantStatus: http.StatusOK},
+		{name: "a duration in range", query: "?window=30m", wantStatus: http.StatusOK},
+		{name: "not a duration", query: "?window=lastweek", wantStatus: http.StatusBadRequest},
+		// Below the floor a percentile is one or two requests.
+		{name: "shorter than a minute", query: "?window=10s", wantStatus: http.StatusBadRequest},
+		// Above the ceiling the answer holds more minutes than a caller can use.
+		{name: "longer than a day", query: "?window=72h", wantStatus: http.StatusBadRequest},
+		{name: "negative", query: "?window=-5m", wantStatus: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := request(t, srv, http.MethodGet,
+				"/v1/environments/"+environment.ID+"/metrics"+tt.query, testToken, nil)
+			if rec.Code != tt.wantStatus {
+				t.Errorf("status = %d, want %d (body: %s)", rec.Code, tt.wantStatus, rec.Body)
+			}
+		})
+	}
+}
+
+func TestEnvironmentAnalysisReadsBothWindows(t *testing.T) {
+	store := newFakeStore()
+	environment := seedEnvironment(store)
+
+	// A slow release: an hour of fast traffic, then fifteen minutes of slow
+	// traffic. The analysis has to reach back past its own window to see it.
+	for minutesAgo := 16; minutesAgo <= 75; minutesAgo++ {
+		seedTraffic(store, environment.ID, minutesAgo, 20, 0, 20)
+	}
+	for minutesAgo := 1; minutesAgo <= 15; minutesAgo++ {
+		seedTraffic(store, environment.ID, minutesAgo, 20, 0, 200)
+	}
+
+	srv := newAPI(store)
+	rec := request(t, srv, http.MethodGet, "/v1/environments/"+environment.ID+"/analysis", testToken, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body)
+	}
+
+	var report analyze.Report
+	if err := json.NewDecoder(rec.Body).Decode(&report); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if report.Verdict != analyze.VerdictFailing {
+		t.Errorf("Verdict = %q, want %q (detail: %s)", report.Verdict, analyze.VerdictFailing, report.Detail)
+	}
+	if report.Baseline.Summary.Requests == 0 {
+		t.Error("the baseline window is empty; the handler did not read back far enough")
+	}
+	if len(report.Remediations) == 0 {
+		t.Error("a failing verdict with nothing to do about it")
+	}
+}
+
+func TestEnvironmentAnalysisOfAQuietEnvironment(t *testing.T) {
+	store := newFakeStore()
+	environment := seedEnvironment(store)
+
+	srv := newAPI(store)
+	rec := request(t, srv, http.MethodGet, "/v1/environments/"+environment.ID+"/analysis", testToken, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body)
+	}
+
+	var report analyze.Report
+	if err := json.NewDecoder(rec.Body).Decode(&report); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// Not "healthy": an environment nobody called has not been shown to work.
+	if report.Verdict != analyze.VerdictInsufficientData {
+		t.Errorf("Verdict = %q, want %q", report.Verdict, analyze.VerdictInsufficientData)
 	}
 }

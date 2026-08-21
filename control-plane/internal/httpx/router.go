@@ -66,6 +66,9 @@ func (a *API) routes() []route {
 		{method: http.MethodPost, path: "/v1/projects/{projectID}/environments", handler: a.handleCreateEnvironment},
 		{method: http.MethodGet, path: "/v1/projects/{projectID}/environments", handler: a.handleListEnvironments},
 
+		{method: http.MethodGet, path: "/v1/environments/{environmentID}/metrics", handler: a.handleEnvironmentMetrics},
+		{method: http.MethodGet, path: "/v1/environments/{environmentID}/analysis", handler: a.handleEnvironmentAnalysis},
+
 		{method: http.MethodGet, path: "/v1/projects/{projectID}/deployments", handler: a.handleListDeployments},
 		{method: http.MethodPost, path: "/v1/deployments", handler: a.handleCreateDeployment},
 		{method: http.MethodGet, path: "/v1/deployments/{deploymentID}", handler: a.handleGetDeployment},

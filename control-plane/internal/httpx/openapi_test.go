@@ -12,6 +12,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/KaumudiRRawal/launchpad/control-plane/internal/analyze"
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/domain"
 	"github.com/KaumudiRRawal/launchpad/control-plane/openapi"
 )
@@ -125,6 +126,13 @@ func TestSchemasMatchTheEncodedTypes(t *testing.T) {
 		{schema: "Environment", value: domain.Environment{}, checkRequired: true},
 		{schema: "Deployment", value: domain.Deployment{}, checkRequired: true},
 		{schema: "DeploymentLog", value: domain.DeploymentLog{}, checkRequired: true},
+		{schema: "MetricSummary", value: domain.MetricSummary{}, checkRequired: true},
+		{schema: "MetricWindow", value: domain.MetricWindow{}, checkRequired: true},
+		{schema: "MetricPoint", value: domain.MetricPoint{}, checkRequired: true},
+		{schema: "EnvironmentMetrics", value: domain.EnvironmentMetrics{}, checkRequired: true},
+		{schema: "AnalysisReport", value: analyze.Report{}, checkRequired: true},
+		{schema: "Finding", value: analyze.Finding{}, checkRequired: true},
+		{schema: "Remediation", value: analyze.Remediation{}, checkRequired: true},
 		{schema: "APIKey", value: domain.APIKey{}, checkRequired: true},
 
 		{schema: "CreateProjectInput", value: domain.CreateProjectInput{}},
