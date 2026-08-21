@@ -224,6 +224,75 @@ type APIKey struct {
 	RevokedAt   *time.Time `json:"revoked_at,omitempty"`
 }
 
+// MetricBucket is one minute of observed traffic for one deployment: the unit
+// the collector writes and the analysis reads.
+type MetricBucket struct {
+	DeploymentID  string
+	EnvironmentID string
+	// CommitSHA names the release these observations belong to. The collector
+	// leaves it empty — it knows only which deployment served the request —
+	// and the store fills it in on read, because a remediation that says "go
+	// back to the previous release" has to name the commit to go back to.
+	CommitSHA string
+	// Bucket is the start of the minute the observations fall in.
+	Bucket       time.Time
+	Requests     int64
+	Failures     int64
+	LatencySumMS float64
+	LatencyMaxMS float64
+	// Histogram counts requests per latency bucket, against the boundaries the
+	// metrics package defines. It is the distribution rather than a summary of
+	// it, so several minutes can be combined into one percentile.
+	Histogram []int64
+}
+
+// MetricSummary is what a window of traffic amounted to. Percentiles are
+// interpolated from the combined histogram of every bucket in the window, not
+// averaged from per-minute percentiles, because an average of percentiles is
+// not a percentile of anything.
+type MetricSummary struct {
+	Requests int64 `json:"requests"`
+	Failures int64 `json:"failures"`
+	// Availability is the fraction of requests that did not fail, and is 1
+	// when there was no traffic: an environment nobody called has not been
+	// shown to be broken.
+	Availability float64 `json:"availability"`
+	LatencyAvgMS float64 `json:"latency_avg_ms"`
+	LatencyP50MS float64 `json:"latency_p50_ms"`
+	LatencyP95MS float64 `json:"latency_p95_ms"`
+	LatencyP99MS float64 `json:"latency_p99_ms"`
+	// LatencyMaxMS is recorded exactly rather than read off the histogram, so
+	// the worst request in a window is reported as what it was even when the
+	// histogram's last bucket has saturated.
+	LatencyMaxMS float64 `json:"latency_max_ms"`
+}
+
+// MetricWindow is a summary and the interval it covers.
+type MetricWindow struct {
+	From    time.Time     `json:"from"`
+	To      time.Time     `json:"to"`
+	Summary MetricSummary `json:"summary"`
+}
+
+// MetricPoint is one minute of an environment's traffic, across every
+// deployment that served it. A redeploy in the middle of a window does not
+// break the series: traffic is continuous even though the deployment behind it
+// is not.
+type MetricPoint struct {
+	Bucket       time.Time `json:"bucket"`
+	Requests     int64     `json:"requests"`
+	Failures     int64     `json:"failures"`
+	LatencyP95MS float64   `json:"latency_p95_ms"`
+}
+
+// EnvironmentMetrics is what an environment's traffic looked like over one
+// window, both as a whole and minute by minute.
+type EnvironmentMetrics struct {
+	EnvironmentID string        `json:"environment_id"`
+	Window        MetricWindow  `json:"window"`
+	Series        []MetricPoint `json:"series"`
+}
+
 // slugPattern is deliberately a DNS label: a project slug and an environment
 // name are both concatenated into a subdomain, so anything not valid in a
 // hostname cannot be allowed in here.
