@@ -86,6 +86,13 @@ test-deploy: ## Run the deploy tests that build and run real containers
 	cd $(CONTROL_PLANE) && LAUNCHPAD_TEST_DOCKER=1 \
 		go test ./internal/deploy -count=1 -v -timeout 20m
 
+.PHONY: tf-check
+tf-check: ## Check the Terraform is formatted and valid (needs terraform on PATH)
+	terraform fmt -check -recursive terraform
+	cd terraform/examples/single-project \
+		&& terraform init -backend=false -input=false >/dev/null \
+		&& terraform validate
+
 .PHONY: vet
 vet: ## Run go vet
 	cd $(CONTROL_PLANE) && go vet ./...

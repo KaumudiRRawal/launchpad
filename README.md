@@ -55,6 +55,9 @@ The control plane is the only component that writes platform state. Deploy
 drivers sit behind one interface, so the same orchestration logic runs a
 container locally during development and a Cloud Run revision in production.
 
+[docs/architecture.md](docs/architecture.md) covers the deployment path, both
+drivers, the isolation model and the measured cost of a deployment.
+
 ### Data model
 
 `accounts` own `projects`. A project has `services` (deployable units — a
@@ -82,6 +85,25 @@ curl localhost:8080/v1/openapi.yaml # the API's own specification
 ```
 
 Run `make help` for every target.
+
+### Deploying somewhere other than a laptop
+
+`LAUNCHPAD_DEPLOY_DRIVER` selects the backend. `docker` is the default and needs
+nothing but a local daemon. `cloudrun` builds with Cloud Build, pushes to
+Artifact Registry and releases Cloud Run services, and additionally requires
+`LAUNCHPAD_GCP_PROJECT` and `LAUNCHPAD_GCP_REGION` — the process refuses to
+start without them, rather than failing one deployment per queued job with the
+same message.
+
+`terraform/` provisions what that driver deploys into: the image repository, the
+database, and the control plane itself with the identities and permissions it
+needs. See [terraform/README.md](terraform/README.md), including what it
+deliberately leaves to you.
+
+```bash
+make image      # build the control-plane image
+make tf-check   # format and validate the Terraform
+```
 
 ### Getting a token
 
@@ -170,6 +192,7 @@ make test              # Go unit tests, no dependencies
 make test-integration  # adds tests that run migrations against a live database
 make dashboard-test    # dashboard tests
 make api-client-check  # fails if the generated types are behind the spec
+make test-deploy       # builds and runs real containers; slow, and prints timings
 make check             # everything, before committing
 ```
 
@@ -190,7 +213,35 @@ otherwise healthy process; it should only stop routing traffic to it.
 
 **Deploy targets are an interface, not a build flag.** The Docker driver makes
 the development loop fast and free. The Cloud Run driver is the same contract
-against a different backend.
+against a different backend, and the engine that drives both knows nothing about
+either beyond three methods.
+
+Most of the Cloud Run driver is translation, and every piece of it is there for
+a specific rejection rather than for tidiness: `PORT` is dropped from the
+environment because Cloud Run sets it from `--port` and fails a deploy that
+passes both, dotted label keys are rewritten because a dot is not legal in a
+Google Cloud label, and service names are cut to 49 characters rather than 63
+because a revision is named `<service>-<suffix>` and has to fit a DNS label
+itself. The cut carries a digest of the full name, so it stays stable — which is
+what makes a release replace its predecessor — without two long names colliding.
+
+**Both drivers shell out to the vendor CLI.** The commands are stable,
+documented and identical to what a person would run by hand, and the alternative
+is a large generated dependency tree to express four calls. A remote build that
+fails can be reproduced by pasting the command out of the log, which is why the
+Cloud Run driver echoes it — with the environment redacted, because build logs
+are readable by anyone who can read the deployment. The bill arrives in the
+image: the control-plane image carries the Google Cloud CLI and git, and comes
+to 819 MB.
+
+**A deployment costs 16 seconds, and 15 of them are the image build.** Measured
+end to end by `make test-deploy` on an M2 Pro: fetch 0.4s, build 15.2–15.8s,
+release 0.2s, and everything the control plane itself does 0.01s. There is
+nothing worth optimising in the orchestration. There is something worth fixing
+in the build — the checkout's `.git` goes into the build context and differs on
+every fetch, so the `COPY` layer never hits the cache and an unchanged service
+recompiles from scratch. Both the numbers and that finding are in
+[docs/architecture.md](docs/architecture.md).
 
 **Ownership is enforced in SQL, not in handlers.** Every query is scoped by
 account in its `WHERE` clause, and creating a deployment joins service to
@@ -323,7 +374,9 @@ Built in public over seven days. Each day is a working increment.
 - [x] **Day 6** — Latency and reliability: measured at the proxy, stored as
       distributions, compared against a baseline, and turned into a ranked list
       of what to fix first
-- [ ] **Day 7** — Terraform modules, Cloud Run driver, documentation
+- [x] **Day 7** — Terraform modules, Cloud Run driver behind the same
+      interface, architecture documentation, and the deploy time measured
+      rather than guessed
 
 ## License
 
