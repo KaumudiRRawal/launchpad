@@ -170,11 +170,12 @@ func (e *Engine) deploy(ctx context.Context, job domain.DeploymentJob, logs *log
 	tag := fmt.Sprintf("launchpad/%s:%s", job.ServiceName, job.DeploymentID[:8])
 
 	logs.WriteLine("stdout", "building "+tag)
-	if err := e.Driver.Build(ctx, BuildRequest{
+	built, err := e.Driver.Build(ctx, BuildRequest{
 		ContextDir: contextDir,
 		Dockerfile: strategy.Dockerfile(job.Port),
 		Tag:        tag,
-	}, logs); err != nil {
+	}, logs)
+	if err != nil {
 		return fmt.Errorf("build image: %w", err)
 	}
 
@@ -183,12 +184,15 @@ func (e *Engine) deploy(ctx context.Context, job domain.DeploymentJob, logs *log
 		return fmt.Errorf("move to deploying: %w", err)
 	}
 
-	logs.WriteLine("stdout", "releasing to "+job.Subdomain)
+	logs.WriteLine("stdout", "releasing "+built.Image+" to "+job.Subdomain)
 	result, err := e.Driver.Release(ctx, ReleaseRequest{
 		// Stable across deployments of this service and environment, so a
 		// release replaces its predecessor rather than accumulating.
-		Name:  workloadName(job),
-		Image: tag,
+		Name: workloadName(job),
+		// The reference the build reported, not the one it was asked for: a
+		// driver that pushed to a registry released from there, and that is
+		// what has to be recorded against the deployment.
+		Image: built.Image,
 		Port:  job.Port,
 		Env: map[string]string{
 			"PORT":                  fmt.Sprint(job.Port),
@@ -209,7 +213,7 @@ func (e *Engine) deploy(ctx context.Context, job domain.DeploymentJob, logs *log
 	// differ after the next one.
 	publicURL := domain.PublicURL(e.BaseDomain, e.ProxyPort, job.Subdomain)
 
-	if err := e.Store.MarkDeploymentLive(ctx, job.DeploymentID, tag, publicURL, result.URL); err != nil {
+	if err := e.Store.MarkDeploymentLive(ctx, job.DeploymentID, built.Image, publicURL, result.URL); err != nil {
 		return fmt.Errorf("mark live: %w", err)
 	}
 

@@ -99,17 +99,22 @@ func main() {
 		_ = exec.Command("docker", "rmi", "--force", tag).Run()
 	})
 
-	if err := driver.Build(ctx, BuildRequest{
+	built, err := driver.Build(ctx, BuildRequest{
 		ContextDir: dir,
 		Dockerfile: strategy.Dockerfile(8080),
 		Tag:        tag,
-	}, logs); err != nil {
+	}, logs)
+	if err != nil {
 		t.Fatalf("Build() error = %v\nlogs:\n%s", err, logs)
+	}
+	// Nothing is pushed anywhere, so the local tag is the whole reference.
+	if built.Image != tag {
+		t.Errorf("Build() image = %q, want %q", built.Image, tag)
 	}
 
 	result, err := driver.Release(ctx, ReleaseRequest{
 		Name:   name,
-		Image:  tag,
+		Image:  built.Image,
 		Port:   8080,
 		Env:    map[string]string{"PORT": "8080"},
 		Labels: map[string]string{"launchpad.test": "true"},

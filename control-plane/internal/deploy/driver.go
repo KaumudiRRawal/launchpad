@@ -13,6 +13,17 @@ type BuildRequest struct {
 	Tag string
 }
 
+// BuildResult reports the image a build produced.
+//
+// It is not always the tag that was asked for. A driver releasing into a cloud
+// has to push somewhere the runtime can pull from, so it qualifies the
+// requested tag into a registry reference — and that reference, not the
+// request, is what the release and the deployment record have to name.
+type BuildResult struct {
+	// Image is the reference to release.
+	Image string
+}
+
 // ReleaseRequest describes one image to put into service.
 type ReleaseRequest struct {
 	// Name identifies the workload, and must be stable across deployments of
@@ -42,7 +53,7 @@ type ReleaseResult struct {
 // against this interface alone, so the two are interchangeable.
 type Driver interface {
 	// Build produces an image and streams progress to logs.
-	Build(ctx context.Context, req BuildRequest, logs LogWriter) error
+	Build(ctx context.Context, req BuildRequest, logs LogWriter) (BuildResult, error)
 	// Release puts an image into service, replacing any earlier workload with
 	// the same name.
 	Release(ctx context.Context, req ReleaseRequest, logs LogWriter) (ReleaseResult, error)

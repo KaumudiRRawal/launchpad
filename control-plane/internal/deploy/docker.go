@@ -33,7 +33,11 @@ func (d *DockerDriver) binary() string {
 }
 
 // Build produces an image from the request's context directory.
-func (d *DockerDriver) Build(ctx context.Context, req BuildRequest, logs LogWriter) error {
+//
+// The image stays in the local daemon: there is no registry to push to, which
+// is most of why the development loop is fast, so the reference it reports back
+// is the tag it was asked for.
+func (d *DockerDriver) Build(ctx context.Context, req BuildRequest, logs LogWriter) (BuildResult, error) {
 	args := []string{"build", "--tag", req.Tag}
 
 	var stdin io.Reader
@@ -45,7 +49,10 @@ func (d *DockerDriver) Build(ctx context.Context, req BuildRequest, logs LogWrit
 	}
 	args = append(args, req.ContextDir)
 
-	return d.run(ctx, args, stdin, logs)
+	if err := d.run(ctx, args, stdin, logs); err != nil {
+		return BuildResult{}, err
+	}
+	return BuildResult{Image: req.Tag}, nil
 }
 
 // Release starts the image, replacing any workload already using the name.

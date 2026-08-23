@@ -25,6 +25,7 @@ type fakeStore struct {
 	transitions []string
 	logs        []string
 	failure     string
+	imageRef    string
 	liveURL     string
 	internalURL string
 	superseded  bool
@@ -56,11 +57,12 @@ func (f *fakeStore) TransitionDeployment(_ context.Context, _ string, from, to d
 	return nil
 }
 
-func (f *fakeStore) MarkDeploymentLive(_ context.Context, _, _, publicURL, internalURL string) error {
+func (f *fakeStore) MarkDeploymentLive(_ context.Context, _, imageRef, publicURL, internalURL string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.transitions = append(f.transitions, "deploying->live")
+	f.imageRef = imageRef
 	f.liveURL = publicURL
 	f.internalURL = internalURL
 	return nil
@@ -129,13 +131,15 @@ type fakeDriver struct {
 
 func (f *fakeDriver) Name() string { return "fake" }
 
-func (f *fakeDriver) Build(_ context.Context, req BuildRequest, logs LogWriter) error {
+func (f *fakeDriver) Build(_ context.Context, req BuildRequest, logs LogWriter) (BuildResult, error) {
 	if f.buildErr != nil {
-		return f.buildErr
+		return BuildResult{}, f.buildErr
 	}
 	f.builtTag = req.Tag
 	logs.WriteLine("stdout", "built "+req.Tag)
-	return nil
+	// Mimics a registry-backed driver: the engine must release and record what
+	// the build reported, not the tag it asked for.
+	return BuildResult{Image: "registry.example/" + req.Tag}, nil
 }
 
 func (f *fakeDriver) Release(_ context.Context, req ReleaseRequest, _ LogWriter) (ReleaseResult, error) {
@@ -212,6 +216,17 @@ func TestEngineHappyPath(t *testing.T) {
 	// The image tag must trace back to the deployment that produced it.
 	if !strings.Contains(driver.builtTag, "11111111") {
 		t.Errorf("built tag %q does not identify the deployment", driver.builtTag)
+	}
+
+	// What gets released and recorded is the reference the build reported. A
+	// driver that pushed the image somewhere else released from there, and a
+	// deployment row naming the tag the engine asked for would name an image
+	// that exists nowhere.
+	if driver.releaseReq.Image != "registry.example/"+driver.builtTag {
+		t.Errorf("released image = %q, want the reference the build reported", driver.releaseReq.Image)
+	}
+	if store.imageRef != "registry.example/"+driver.builtTag {
+		t.Errorf("recorded image = %q, want the reference the build reported", store.imageRef)
 	}
 
 	// The workload name must be stable so a release replaces its predecessor
