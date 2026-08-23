@@ -29,6 +29,36 @@ type Config struct {
 	// "localhost" works without any DNS setup, because every *.localhost name
 	// already resolves to the loopback address.
 	BaseDomain string
+	// DeployDriver names the backend deployments run on.
+	DeployDriver string
+	// CloudRun is read only when DeployDriver selects it.
+	CloudRun CloudRunConfig
+}
+
+// Deploy driver names. The default is Docker because it is the one that needs
+// no account, no billing and no credentials to try.
+const (
+	DriverDocker   = "docker"
+	DriverCloudRun = "cloudrun"
+)
+
+// CloudRunConfig holds what the Cloud Run driver needs. The fields are grouped
+// because they are only meaningful together: a project without a region names
+// nothing deployable.
+type CloudRunConfig struct {
+	Project    string
+	Region     string
+	Repository string
+	// ServiceAccount is the identity deployed workloads run as. Left empty,
+	// Google falls back to the project's default compute account, which holds
+	// far more permission than somebody else's code should get.
+	ServiceAccount string
+	// AllowUnauthenticated makes deployed workloads publicly reachable, which
+	// they have to be: the platform's proxy forwards to them without minting an
+	// identity token, so a workload requiring IAM authentication would answer
+	// 403 to every request arriving through the front door. Installs that front
+	// Cloud Run with something that does sign requests set it false.
+	AllowUnauthenticated bool
 }
 
 // ProxyPort returns the port from ProxyAddr, which the public URL of an
@@ -58,9 +88,43 @@ func Load() (Config, error) {
 		DeployWorkers:   2,
 		ProxyAddr:       envOr("LAUNCHPAD_PROXY_ADDR", ":8081"),
 		BaseDomain:      envOr("LAUNCHPAD_BASE_DOMAIN", "localhost"),
+		DeployDriver:    envOr("LAUNCHPAD_DEPLOY_DRIVER", DriverDocker),
+		CloudRun: CloudRunConfig{
+			Project:              os.Getenv("LAUNCHPAD_GCP_PROJECT"),
+			Region:               os.Getenv("LAUNCHPAD_GCP_REGION"),
+			Repository:           envOr("LAUNCHPAD_ARTIFACT_REPOSITORY", "launchpad"),
+			ServiceAccount:       os.Getenv("LAUNCHPAD_CLOUD_RUN_SERVICE_ACCOUNT"),
+			AllowUnauthenticated: true,
+		},
 	}
 
 	var problems []string
+
+	switch cfg.DeployDriver {
+	case DriverDocker:
+	case DriverCloudRun:
+		// Checked at boot rather than when the first deployment is claimed: a
+		// misconfigured driver should stop the process starting, not fail one
+		// deployment per queued job with the same message.
+		if cfg.CloudRun.Project == "" {
+			problems = append(problems, "LAUNCHPAD_GCP_PROJECT is required when the deploy driver is cloudrun")
+		}
+		if cfg.CloudRun.Region == "" {
+			problems = append(problems, "LAUNCHPAD_GCP_REGION is required when the deploy driver is cloudrun")
+		}
+	default:
+		problems = append(problems, fmt.Sprintf("LAUNCHPAD_DEPLOY_DRIVER %q is not one of %s, %s",
+			cfg.DeployDriver, DriverDocker, DriverCloudRun))
+	}
+
+	if raw := os.Getenv("LAUNCHPAD_CLOUD_RUN_ALLOW_UNAUTHENTICATED"); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("LAUNCHPAD_CLOUD_RUN_ALLOW_UNAUTHENTICATED %q is not a boolean", raw))
+		} else {
+			cfg.CloudRun.AllowUnauthenticated = parsed
+		}
+	}
 
 	if raw := os.Getenv("LAUNCHPAD_DEPLOY_WORKERS"); raw != "" {
 		parsed, err := strconv.Atoi(raw)

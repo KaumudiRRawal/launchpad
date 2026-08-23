@@ -53,6 +53,79 @@ func TestLoad(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "docker is the default deploy driver",
+			env:  map[string]string{"LAUNCHPAD_DATABASE_URL": "postgres://localhost/launchpad"},
+			check: func(t *testing.T, c Config) {
+				if c.DeployDriver != DriverDocker {
+					t.Errorf("DeployDriver = %q, want %q", c.DeployDriver, DriverDocker)
+				}
+			},
+		},
+		{
+			name: "an unknown deploy driver is rejected",
+			env: map[string]string{
+				"LAUNCHPAD_DATABASE_URL":  "postgres://localhost/launchpad",
+				"LAUNCHPAD_DEPLOY_DRIVER": "kubernetes",
+			},
+			wantErr: true,
+		},
+		{
+			// A driver that cannot name what it deploys into should stop the
+			// process starting, not fail one deployment per queued job.
+			name: "cloudrun without a project or region is rejected",
+			env: map[string]string{
+				"LAUNCHPAD_DATABASE_URL":  "postgres://localhost/launchpad",
+				"LAUNCHPAD_DEPLOY_DRIVER": DriverCloudRun,
+			},
+			wantErr: true,
+		},
+		{
+			name: "cloudrun with a project and region is configured",
+			env: map[string]string{
+				"LAUNCHPAD_DATABASE_URL":  "postgres://localhost/launchpad",
+				"LAUNCHPAD_DEPLOY_DRIVER": DriverCloudRun,
+				"LAUNCHPAD_GCP_PROJECT":   "launchpad-prod",
+				"LAUNCHPAD_GCP_REGION":    "europe-west1",
+			},
+			check: func(t *testing.T, c Config) {
+				if c.CloudRun.Project != "launchpad-prod" {
+					t.Errorf("CloudRun.Project = %q, want launchpad-prod", c.CloudRun.Project)
+				}
+				if c.CloudRun.Repository != "launchpad" {
+					t.Errorf("CloudRun.Repository = %q, want the default launchpad", c.CloudRun.Repository)
+				}
+				// Deployed workloads are reached through the proxy, which sends
+				// no identity token, so they have to be publicly reachable
+				// unless something that does sign requests is in front.
+				if !c.CloudRun.AllowUnauthenticated {
+					t.Error("CloudRun.AllowUnauthenticated = false, want true by default")
+				}
+			},
+		},
+		{
+			name: "cloud run public access can be turned off",
+			env: map[string]string{
+				"LAUNCHPAD_DATABASE_URL":                    "postgres://localhost/launchpad",
+				"LAUNCHPAD_DEPLOY_DRIVER":                   DriverCloudRun,
+				"LAUNCHPAD_GCP_PROJECT":                     "launchpad-prod",
+				"LAUNCHPAD_GCP_REGION":                      "europe-west1",
+				"LAUNCHPAD_CLOUD_RUN_ALLOW_UNAUTHENTICATED": "false",
+			},
+			check: func(t *testing.T, c Config) {
+				if c.CloudRun.AllowUnauthenticated {
+					t.Error("CloudRun.AllowUnauthenticated = true, want false")
+				}
+			},
+		},
+		{
+			name: "a non-boolean public access setting is rejected",
+			env: map[string]string{
+				"LAUNCHPAD_DATABASE_URL":                    "postgres://localhost/launchpad",
+				"LAUNCHPAD_CLOUD_RUN_ALLOW_UNAUTHENTICATED": "sometimes",
+			},
+			wantErr: true,
+		},
+		{
 			name: "overrides are honoured",
 			env: map[string]string{
 				"LAUNCHPAD_DATABASE_URL":     "postgres://localhost/launchpad",
@@ -60,6 +133,9 @@ func TestLoad(t *testing.T) {
 				"LAUNCHPAD_HTTP_ADDR":        ":9000",
 				"LAUNCHPAD_LOG_LEVEL":        "debug",
 				"LAUNCHPAD_SHUTDOWN_TIMEOUT": "30s",
+				"LAUNCHPAD_PROXY_ADDR":       ":9081",
+				"LAUNCHPAD_BASE_DOMAIN":      "launchpad.example",
+				"LAUNCHPAD_DEPLOY_WORKERS":   "4",
 			},
 			check: func(t *testing.T, c Config) {
 				if !c.IsProduction() {
@@ -74,6 +150,16 @@ func TestLoad(t *testing.T) {
 				if c.ShutdownTimeout != 30*time.Second {
 					t.Errorf("ShutdownTimeout = %v, want 30s", c.ShutdownTimeout)
 				}
+				if c.DeployWorkers != 4 {
+					t.Errorf("DeployWorkers = %d, want 4", c.DeployWorkers)
+				}
+				if c.BaseDomain != "launchpad.example" {
+					t.Errorf("BaseDomain = %q, want launchpad.example", c.BaseDomain)
+				}
+				// The environment's public URL has to name the proxy's port.
+				if c.ProxyPort() != 9081 {
+					t.Errorf("ProxyPort() = %d, want 9081", c.ProxyPort())
+				}
 			},
 		},
 	}
@@ -86,6 +172,15 @@ func TestLoad(t *testing.T) {
 		"LAUNCHPAD_DATABASE_URL",
 		"LAUNCHPAD_LOG_LEVEL",
 		"LAUNCHPAD_SHUTDOWN_TIMEOUT",
+		"LAUNCHPAD_DEPLOY_WORKERS",
+		"LAUNCHPAD_PROXY_ADDR",
+		"LAUNCHPAD_BASE_DOMAIN",
+		"LAUNCHPAD_DEPLOY_DRIVER",
+		"LAUNCHPAD_GCP_PROJECT",
+		"LAUNCHPAD_GCP_REGION",
+		"LAUNCHPAD_ARTIFACT_REPOSITORY",
+		"LAUNCHPAD_CLOUD_RUN_SERVICE_ACCOUNT",
+		"LAUNCHPAD_CLOUD_RUN_ALLOW_UNAUTHENTICATED",
 	}
 
 	for _, tt := range tests {

@@ -104,6 +104,8 @@ func run() error {
 		collector.Run(ctx)
 	}()
 
+	driver := deployDriver(cfg)
+
 	// The deploy workers run in-process. Splitting them into a separate
 	// service would buy independent scaling that a platform this size does not
 	// need yet, at the cost of a second deployable to operate. The claim query
@@ -111,7 +113,7 @@ func run() error {
 	for i := range cfg.DeployWorkers {
 		engine := &deploy.Engine{
 			Store:       repo,
-			Driver:      &deploy.DockerDriver{},
+			Driver:      driver,
 			Fetcher:     &deploy.GitFetcher{},
 			Log:         log.With(slog.Int("worker", i)),
 			Invalidator: router,
@@ -187,6 +189,22 @@ func run() error {
 
 	log.Info("shutdown complete")
 	return nil
+}
+
+// deployDriver builds the backend deployments run on. Config has already
+// rejected an unknown name and a Cloud Run install missing its project or
+// region, so the choice here cannot fail.
+func deployDriver(cfg config.Config) deploy.Driver {
+	if cfg.DeployDriver == config.DriverCloudRun {
+		return &deploy.CloudRunDriver{
+			Project:              cfg.CloudRun.Project,
+			Region:               cfg.CloudRun.Region,
+			Repository:           cfg.CloudRun.Repository,
+			ServiceAccount:       cfg.CloudRun.ServiceAccount,
+			AllowUnauthenticated: cfg.CloudRun.AllowUnauthenticated,
+		}
+	}
+	return &deploy.DockerDriver{}
 }
 
 func newLogger(cfg config.Config) *slog.Logger {
