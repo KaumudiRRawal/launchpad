@@ -1,0 +1,10 @@
+# Copy to terraform.tfvars. It is gitignored: *.tfvars is, and this example is
+# the exception.
+project_id  = "launchpad-prod"
+region      = "europe-west1"
+base_domain = "apps.example.com"
+
+# Built by `make image` and pushed to the repository this install creates. A
+# digest rather than a tag keeps a revision running the bytes it was created
+# with, whatever :latest comes to mean later.
+image = "europe-west1-docker.pkg.dev/launchpad-prod/launchpad/control-plane@sha256:..."

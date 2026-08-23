@@ -23,6 +23,10 @@ dist/
 .terraform/
 *.tfstate
 *.tfstate.*
+# Not committed on purpose: a lock file records which registry the providers
+# came from, so one written by OpenTofu names registry.opentofu.org and breaks
+# `terraform init` for anyone using Terraform, and the reverse.
+.terraform.lock.hcl
 
 # Editor / OS
 .DS_Store
