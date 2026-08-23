@@ -1,0 +1,13 @@
+# The build context is the repository root, and almost none of it belongs in a
+# build. .git is the exception: the Go toolchain reads the VCS revision from it
+# and stamps it into the binary, which is what /v1/version reports.
+dashboard/node_modules/
+dashboard/dist/
+bin/
+docs/
+terraform/
+.github/
+*.md
+.env
+.env.*
+coverage.out

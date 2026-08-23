@@ -37,6 +37,13 @@ build: ## Compile the control-plane binaries into bin/
 	cd $(CONTROL_PLANE) && go build -o ../bin/launchpad-api ./cmd/api
 	cd $(CONTROL_PLANE) && go build -o ../bin/launchpad-bootstrap ./cmd/bootstrap
 
+# Built from the repository root rather than control-plane/ so the Go toolchain
+# can read the VCS revision out of .git and stamp it into the binary, which is
+# what /v1/version reports.
+.PHONY: image
+image: ## Build the control-plane container image
+	docker build -f $(CONTROL_PLANE)/Dockerfile -t launchpad-control-plane:$(shell git rev-parse --short HEAD) .
+
 .PHONY: test
 test: ## Run unit tests (database integration tests are skipped)
 	cd $(CONTROL_PLANE) && go test ./...
