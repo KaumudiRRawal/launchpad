@@ -1,13 +1,11 @@
 package deploy
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"os/exec"
 	"strings"
-	"sync"
 )
 
 // DockerDriver builds and runs workloads with the local Docker daemon.
@@ -115,47 +113,13 @@ func (d *DockerDriver) publishedPort(ctx context.Context, name string, container
 	return port, nil
 }
 
-// run executes a docker command, streaming both output streams to logs as
-// they arrive rather than buffering until the command finishes. A build that
-// takes minutes should show progress while it runs.
+// run executes a docker command, streaming its output to logs as it arrives.
 func (d *DockerDriver) run(ctx context.Context, args []string, stdin io.Reader, logs LogWriter) error {
 	cmd := exec.CommandContext(ctx, d.binary(), args...)
 	cmd.Stdin = stdin
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("pipe stdout: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("pipe stderr: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start docker %s: %w", args[0], err)
-	}
-
-	// Both pipes must be drained concurrently: a command that fills one while
-	// the reader is blocked on the other would deadlock.
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); scan(stdout, "stdout", logs) }()
-	go func() { defer wg.Done(); scan(stderr, "stderr", logs) }()
-	wg.Wait()
-
-	if err := cmd.Wait(); err != nil {
+	if err := streamCommand(cmd, logs); err != nil {
 		return fmt.Errorf("docker %s: %w", args[0], err)
 	}
 	return nil
-}
-
-func scan(r io.Reader, stream string, logs LogWriter) {
-	scanner := bufio.NewScanner(r)
-	// Build output can carry very long lines; the default 64 KiB limit would
-	// abort the scan and silently truncate the log.
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
-	for scanner.Scan() {
-		logs.WriteLine(stream, scanner.Text())
-	}
 }
