@@ -79,6 +79,13 @@ api-client: dashboard-install ## Regenerate the dashboard's API types from the O
 api-client-check: dashboard-install ## Fail if the generated API types are behind the spec
 	cd $(DASHBOARD) && npm run check:api
 
+# Builds and runs real containers, so it is slow and kept out of `make check`.
+# The pipeline test prints where a deployment's time went, which is why -v.
+.PHONY: test-deploy
+test-deploy: ## Run the deploy tests that build and run real containers
+	cd $(CONTROL_PLANE) && LAUNCHPAD_TEST_DOCKER=1 \
+		go test ./internal/deploy -count=1 -v -timeout 20m
+
 .PHONY: vet
 vet: ## Run go vet
 	cd $(CONTROL_PLANE) && go vet ./...
