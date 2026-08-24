@@ -35,17 +35,15 @@ var (
 // deployment, flattened from the rows it is spread across so the worker makes
 // one query rather than four.
 type DeploymentJob struct {
-	DeploymentID    string
-	ServiceID       string
-	EnvironmentID   string
-	CommitSHA       string
-	RepoURL         string
-	SourcePath      string
-	Port            int
-	ServiceName     string
-	Subdomain       string
-	EnvironmentKind EnvironmentKind
-	EnvironmentName string
+	DeploymentID  string
+	ServiceID     string
+	EnvironmentID string
+	CommitSHA     string
+	RepoURL       string
+	SourcePath    string
+	Port          int
+	ServiceName   string
+	Subdomain     string
 }
 
 // Upstream is where the proxy sends traffic arriving for one environment.
