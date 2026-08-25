@@ -21,14 +21,24 @@ import (
 const (
 	testToken     = "lp_deadbeef_secret"
 	testAccountID = "account-1"
+	// The address the proxy answers on, so a rendered environment URL in a
+	// test looks like the one a caller is given.
+	testBaseDomain = "localhost"
+	testProxyPort  = 8080
 )
 
-// fakeStore is an in-memory Store. It models the two behaviours the handlers
-// actually depend on — ownership scoping and slug uniqueness — so the tests
-// exercise real decisions rather than a mock that always succeeds.
+// fakeStore is an in-memory Store. It models the behaviours the handlers
+// actually depend on — ownership scoping, slug uniqueness, and the difference
+// between a query that reads through a join and one that writes through it —
+// so the tests exercise real decisions rather than a mock that always
+// succeeds. Where the real query's shape decides the answer a caller gets,
+// the method here says which shape it is reproducing.
 type fakeStore struct {
 	projects       []domain.Project
+	services       []domain.Service
 	environments   []domain.Environment
+	deployments    []domain.Deployment
+	apiKeys        []domain.APIKey
 	metricBuckets  []domain.MetricBucket
 	deploymentLogs []domain.DeploymentLog
 	nextID         int
@@ -114,12 +124,38 @@ func (f *fakeStore) DeleteProject(_ context.Context, accountID, id string) error
 	return domain.ErrNotFound
 }
 
-func (f *fakeStore) CreateService(_ context.Context, _, projectID string, in domain.CreateServiceInput) (domain.Service, error) {
-	return domain.Service{ID: "service-1", ProjectID: projectID, Name: in.Name, SourcePath: in.SourcePath, Port: in.Port}, nil
+func (f *fakeStore) CreateService(_ context.Context, accountID, projectID string, in domain.CreateServiceInput) (domain.Service, error) {
+	// The INSERT ... SELECT FROM projects finds no row to attach to when the
+	// project is not the caller's, which reaches the handler as ErrNotFound.
+	if !f.ownsProject(accountID, projectID) {
+		return domain.Service{}, domain.ErrNotFound
+	}
+
+	f.nextID++
+	s := domain.Service{
+		ID:         "service-" + strconv.Itoa(f.nextID),
+		ProjectID:  projectID,
+		Name:       in.Name,
+		SourcePath: in.SourcePath,
+		Port:       in.Port,
+	}
+	f.services = append(f.services, s)
+	return s, nil
 }
 
-func (f *fakeStore) ListServices(context.Context, string, string) ([]domain.Service, error) {
-	return []domain.Service{}, nil
+func (f *fakeStore) ListServices(_ context.Context, accountID, projectID string) ([]domain.Service, error) {
+	// Reading is a join rather than a lookup, so another account's project is
+	// an empty result and not an error.
+	out := []domain.Service{}
+	if !f.ownsProject(accountID, projectID) {
+		return out, nil
+	}
+	for _, s := range f.services {
+		if s.ProjectID == projectID {
+			out = append(out, s)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeStore) CreateEnvironment(_ context.Context, _, projectID string, in domain.CreateEnvironmentInput, subdomain string) (domain.Environment, error) {
@@ -128,8 +164,27 @@ func (f *fakeStore) CreateEnvironment(_ context.Context, _, projectID string, in
 	return e, nil
 }
 
-func (f *fakeStore) ListEnvironments(context.Context, string, string) ([]domain.Environment, error) {
-	return []domain.Environment{}, nil
+func (f *fakeStore) ListEnvironments(_ context.Context, accountID, projectID string) ([]domain.Environment, error) {
+	out := []domain.Environment{}
+	if !f.ownsProject(accountID, projectID) {
+		return out, nil
+	}
+	for _, e := range f.environments {
+		if e.ProjectID == projectID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+// ownsProject is the join every project-scoped query starts from.
+func (f *fakeStore) ownsProject(accountID, projectID string) bool {
+	for _, p := range f.projects {
+		if p.ID == projectID && p.AccountID == accountID {
+			return true
+		}
+	}
+	return false
 }
 
 // owns mirrors what the real queries do in SQL: reach the environment through
@@ -180,30 +235,92 @@ func (f *fakeStore) CreateDeployment(_ context.Context, _ string, in domain.Crea
 	}, nil
 }
 
-func (f *fakeStore) GetDeployment(context.Context, string, string) (domain.Deployment, error) {
+// deploymentProject resolves a deployment to the project that owns it the way
+// the real queries do, through its service.
+func (f *fakeStore) deploymentProject(deploymentID string) (string, bool) {
+	for _, d := range f.deployments {
+		if d.ID != deploymentID {
+			continue
+		}
+		for _, s := range f.services {
+			if s.ID == d.ServiceID {
+				return s.ProjectID, true
+			}
+		}
+	}
+	return "", false
+}
+
+func (f *fakeStore) GetDeployment(_ context.Context, accountID, id string) (domain.Deployment, error) {
+	projectID, ok := f.deploymentProject(id)
+	if !ok || !f.ownsProject(accountID, projectID) {
+		return domain.Deployment{}, domain.ErrNotFound
+	}
+	for _, d := range f.deployments {
+		if d.ID == id {
+			return d, nil
+		}
+	}
 	return domain.Deployment{}, domain.ErrNotFound
 }
 
-func (f *fakeStore) ListDeployments(context.Context, string, string) ([]domain.Deployment, error) {
-	return []domain.Deployment{}, nil
+func (f *fakeStore) ListDeployments(_ context.Context, accountID, projectID string) ([]domain.Deployment, error) {
+	out := []domain.Deployment{}
+	if !f.ownsProject(accountID, projectID) {
+		return out, nil
+	}
+	for _, d := range f.deployments {
+		if p, ok := f.deploymentProject(d.ID); ok && p == projectID {
+			out = append(out, d)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeStore) CreateAPIKey(_ context.Context, accountID, name string) (domain.APIKey, string, error) {
-	return domain.APIKey{ID: "key-1", AccountID: accountID, Name: name, TokenPrefix: "lp_deadbeef"}, testToken, nil
+	f.nextID++
+	k := domain.APIKey{
+		ID:          "key-" + strconv.Itoa(f.nextID),
+		AccountID:   accountID,
+		Name:        name,
+		TokenPrefix: "lp_deadbeef",
+	}
+	f.apiKeys = append(f.apiKeys, k)
+	return k, testToken, nil
 }
 
-func (f *fakeStore) ListAPIKeys(context.Context, string) ([]domain.APIKey, error) {
-	return []domain.APIKey{}, nil
+func (f *fakeStore) ListAPIKeys(_ context.Context, accountID string) ([]domain.APIKey, error) {
+	out := []domain.APIKey{}
+	for _, k := range f.apiKeys {
+		if k.AccountID == accountID {
+			out = append(out, k)
+		}
+	}
+	return out, nil
 }
 
-func (f *fakeStore) RevokeAPIKey(context.Context, string, string) error { return nil }
+// RevokeAPIKey reproduces the real UPDATE's WHERE clause, revoked_at IS NULL
+// included, so revoking twice reports not found here as well.
+func (f *fakeStore) RevokeAPIKey(_ context.Context, accountID, id string) error {
+	for i, k := range f.apiKeys {
+		if k.ID != id || k.AccountID != accountID || k.RevokedAt != nil {
+			continue
+		}
+		now := time.Now()
+		f.apiKeys[i].RevokedAt = &now
+		return nil
+	}
+	return domain.ErrNotFound
+}
 
 func newAPI(store Store) http.Handler {
 	api := &API{
-		DB:      stubPinger{},
-		Store:   store,
-		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Version: "test",
+		DB:         stubPinger{},
+		Store:      store,
+		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Version:    "test",
+		BaseDomain: testBaseDomain,
+		ProxyPort:  testProxyPort,
 	}
 	return api.Routes()
 }
