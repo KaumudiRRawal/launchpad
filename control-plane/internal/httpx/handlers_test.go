@@ -585,6 +585,139 @@ func TestCreateEnvironmentDerivesSubdomain(t *testing.T) {
 	}
 }
 
+func TestCreateAndListServices(t *testing.T) {
+	store := newFakeStore()
+	store.projects = append(store.projects, domain.Project{
+		ID: "p1", AccountID: testAccountID, Slug: "demo",
+	})
+	srv := newAPI(store)
+
+	rec := request(t, srv, http.MethodPost, "/v1/projects/p1/services", testToken, map[string]any{
+		"name":        "api",
+		"source_path": "services/api",
+		"port":        9000,
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body: %s)", rec.Code, rec.Body)
+	}
+
+	var created domain.Service
+	if err := json.NewDecoder(rec.Body).Decode(&created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// The project comes from the path, not the body, so a caller cannot name
+	// one project in the URL and have the service land under another.
+	if created.ProjectID != "p1" {
+		t.Errorf("project_id = %q, want p1", created.ProjectID)
+	}
+	if created.Name != "api" || created.SourcePath != "services/api" || created.Port != 9000 {
+		t.Errorf("created = %+v, want the posted service", created)
+	}
+
+	rec = request(t, srv, http.MethodGet, "/v1/projects/p1/services", testToken, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want 200 (body: %s)", rec.Code, rec.Body)
+	}
+
+	var listed struct {
+		Services []domain.Service `json:"services"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&listed); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(listed.Services) != 1 || listed.Services[0].ID != created.ID {
+		t.Errorf("services = %+v, want only the one just created", listed.Services)
+	}
+}
+
+// TestProjectSubresourcesAreScopedToTheAccount holds the handlers to passing
+// the authenticated account down to the store. Ownership is enforced in SQL,
+// which only protects anything if the account reaching the query is the one
+// that presented the token — a handler passing the path's project ID, or
+// nothing at all, would hand over another account's rows and every test above
+// would still pass.
+func TestProjectSubresourcesAreScopedToTheAccount(t *testing.T) {
+	store := newFakeStore()
+	store.projects = append(store.projects, domain.Project{
+		ID: "theirs", AccountID: "account-2", Slug: "secret",
+	})
+	store.services = append(store.services, domain.Service{
+		ID: "service-theirs", ProjectID: "theirs", Name: "api",
+	})
+	store.environments = append(store.environments, domain.Environment{
+		ID: "env-theirs", ProjectID: "theirs", Kind: domain.EnvironmentProduction,
+		Name: "production", Subdomain: "production-secret",
+	})
+	store.deployments = append(store.deployments, domain.Deployment{
+		ID: "deploy-theirs", ServiceID: "service-theirs", EnvironmentID: "env-theirs",
+		Status: domain.DeploymentLive,
+	})
+	srv := newAPI(store)
+
+	// Writing under someone else's project is a 404: the insert joins through
+	// projects and finds nothing to attach to.
+	rec := request(t, srv, http.MethodPost, "/v1/projects/theirs/services", testToken,
+		map[string]any{"name": "api"})
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("POST services: status = %d, want 404 (body: %s)", rec.Code, rec.Body)
+	}
+
+	// Reading is a join, so it yields an empty collection rather than an
+	// error. That is the same answer a project with nothing in it gives, which
+	// is the point: the response does not tell a caller whether the ID exists.
+	for _, tt := range []struct {
+		path string
+		key  string
+	}{
+		{path: "/v1/projects/theirs/services", key: "services"},
+		{path: "/v1/projects/theirs/environments", key: "environments"},
+		{path: "/v1/projects/theirs/deployments", key: "deployments"},
+	} {
+		t.Run(tt.path, func(t *testing.T) {
+			rec := request(t, srv, http.MethodGet, tt.path, testToken, nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body)
+			}
+			if want := `"` + tt.key + `":[]`; !strings.Contains(rec.Body.String(), want) {
+				t.Errorf("body = %s, want %s", rec.Body, want)
+			}
+		})
+	}
+}
+
+// TestListEnvironmentsRendersThePublicURL exists because the address is
+// derived at render time rather than stored, so every handler that returns an
+// environment has to derive it. The listing is what the dashboard links from.
+func TestListEnvironmentsRendersThePublicURL(t *testing.T) {
+	store := newFakeStore()
+	store.projects = append(store.projects, domain.Project{
+		ID: "p1", AccountID: testAccountID, Slug: "demo",
+	})
+	store.environments = append(store.environments, domain.Environment{
+		ID: "env-1", ProjectID: "p1", Kind: domain.EnvironmentProduction,
+		Name: "production", Subdomain: "production-demo",
+	})
+	srv := newAPI(store)
+
+	rec := request(t, srv, http.MethodGet, "/v1/projects/p1/environments", testToken, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body)
+	}
+
+	var listed struct {
+		Environments []domain.Environment `json:"environments"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&listed); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(listed.Environments) != 1 {
+		t.Fatalf("environments = %+v, want 1", listed.Environments)
+	}
+	if want := "http://production-demo.localhost:8080"; listed.Environments[0].URL != want {
+		t.Errorf("url = %q, want %q", listed.Environments[0].URL, want)
+	}
+}
+
 func TestCreateDeploymentValidatesCommitSHA(t *testing.T) {
 	srv := newAPI(newFakeStore())
 
@@ -604,6 +737,48 @@ func TestCreateDeploymentValidatesCommitSHA(t *testing.T) {
 	})
 	if rec.Code != http.StatusCreated {
 		t.Errorf("full SHA: status = %d, want 201 (body: %s)", rec.Code, rec.Body)
+	}
+}
+
+func TestGetDeployment(t *testing.T) {
+	store := newFakeStore()
+	store.projects = append(store.projects, domain.Project{
+		ID: "p1", AccountID: testAccountID, Slug: "demo",
+	})
+	store.services = append(store.services, domain.Service{ID: "s1", ProjectID: "p1", Name: "api"})
+	store.deployments = append(store.deployments, domain.Deployment{
+		ID: "d1", ServiceID: "s1", EnvironmentID: "e1",
+		CommitSHA: "0123456789abcdef0123456789abcdef01234567",
+		Status:    domain.DeploymentBuilding,
+	})
+	srv := newAPI(store)
+
+	rec := request(t, srv, http.MethodGet, "/v1/deployments/d1", testToken, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body)
+	}
+
+	var got domain.Deployment
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.ID != "d1" || got.Status != domain.DeploymentBuilding {
+		t.Errorf("deployment = %+v, want d1 building", got)
+	}
+
+	// A deployment reached through another account's service, and one that was
+	// never there, have to be the same answer.
+	store.projects = append(store.projects, domain.Project{ID: "p2", AccountID: "account-2"})
+	store.services = append(store.services, domain.Service{ID: "s2", ProjectID: "p2"})
+	store.deployments = append(store.deployments, domain.Deployment{ID: "d2", ServiceID: "s2"})
+
+	for _, id := range []string{"d2", "does-not-exist"} {
+		t.Run(id, func(t *testing.T) {
+			rec := request(t, srv, http.MethodGet, "/v1/deployments/"+id, testToken, nil)
+			if rec.Code != http.StatusNotFound {
+				t.Errorf("status = %d, want 404 (body: %s)", rec.Code, rec.Body)
+			}
+		})
 	}
 }
 
@@ -630,6 +805,56 @@ func TestCreateAPIKeyReturnsPlaintextOnce(t *testing.T) {
 	rec = request(t, srv, http.MethodGet, "/v1/api-keys", testToken, nil)
 	if strings.Contains(rec.Body.String(), body.Token) {
 		t.Error("list response leaked the plaintext token")
+	}
+}
+
+func TestRevokeAPIKey(t *testing.T) {
+	store := newFakeStore()
+	store.apiKeys = append(store.apiKeys,
+		domain.APIKey{ID: "mine", AccountID: testAccountID, Name: "CI"},
+		domain.APIKey{ID: "theirs", AccountID: "account-2", Name: "Theirs"},
+	)
+	srv := newAPI(store)
+
+	rec := request(t, srv, http.MethodDelete, "/v1/api-keys/mine", testToken, nil)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 (body: %s)", rec.Code, rec.Body)
+	}
+
+	tests := []struct {
+		name string
+		id   string
+	}{
+		// Revoking twice must not report success the second time, so a caller
+		// cannot read a 204 as "this key has only now stopped working".
+		{name: "already revoked", id: "mine"},
+		{name: "another account's key", id: "theirs"},
+		{name: "no such key", id: "nope"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := request(t, srv, http.MethodDelete, "/v1/api-keys/"+tt.id, testToken, nil)
+			if rec.Code != http.StatusNotFound {
+				t.Errorf("status = %d, want 404 (body: %s)", rec.Code, rec.Body)
+			}
+		})
+	}
+
+	// The key that was revoked is still listed, revoked rather than absent: a
+	// caller auditing their credentials needs to see that it existed.
+	rec = request(t, srv, http.MethodGet, "/v1/api-keys", testToken, nil)
+	var listed struct {
+		APIKeys []domain.APIKey `json:"api_keys"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&listed); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(listed.APIKeys) != 1 {
+		t.Fatalf("api_keys = %+v, want only this account's one key", listed.APIKeys)
+	}
+	if listed.APIKeys[0].RevokedAt == nil {
+		t.Error("revoked key is listed as active")
 	}
 }
 
