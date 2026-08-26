@@ -467,6 +467,49 @@ func TestMarkDeploymentFailedAcceptsEveryStageAFailureCanReach(t *testing.T) {
 	}
 }
 
+// TestMarkDeploymentFailedRejectsBytesPostgresCannotStore pins the constraint
+// that the deploy engine sanitizes its failure messages to satisfy. The reason
+// is assembled from a subprocess's output — the fetcher puts the remote's own
+// bytes into its error — and a text column holds neither invalid UTF-8 nor a
+// NUL. Here the write that would record the failure is the one that fails, so
+// the deployment stays in building with nothing saying why: the cost of
+// skipping the sanitizing is a stuck row, not a mangled string.
+func TestMarkDeploymentFailedRejectsBytesPostgresCannotStore(t *testing.T) {
+	f := newDeploymentFixture(t, "rawbytes")
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name   string
+		reason string
+	}{
+		{name: "latin-1 output", reason: "remote: caf\xe9 not found"},
+		{name: "a multi-byte character cut in half", reason: "remote: caf\xc3"},
+		{name: "a NUL byte", reason: "remote: before\x00after"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := f.queue(t, 300)
+			if err := f.repo.TransitionDeployment(ctx, d.ID,
+				domain.DeploymentQueued, domain.DeploymentBuilding); err != nil {
+				t.Fatalf("TransitionDeployment() error = %v", err)
+			}
+
+			if err := f.repo.MarkDeploymentFailed(ctx, d.ID, tc.reason); err == nil {
+				t.Fatal("MarkDeploymentFailed() = nil, want the database to refuse the bytes")
+			}
+
+			got, err := f.repo.GetDeployment(ctx, f.account.ID, d.ID)
+			if err != nil {
+				t.Fatalf("GetDeployment() error = %v", err)
+			}
+			// The point of the sanitizing: without it this is where a
+			// deployment is abandoned.
+			if got.Status != domain.DeploymentBuilding {
+				t.Errorf("status = %q, want %q", got.Status, domain.DeploymentBuilding)
+			}
+		})
+	}
+}
+
 // TestDeploymentLogsFollowACursor covers what a log follower depends on: lines
 // come back in sequence order, asking for everything after a cursor returns
 // only newer lines, and a reader from another account sees none of it.
