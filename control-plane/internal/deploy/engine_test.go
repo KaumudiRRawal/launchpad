@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/domain"
 )
@@ -307,6 +308,42 @@ func TestEngineRecordsFailures(t *testing.T) {
 	}
 }
 
+// TestEngineFailureMessagesAreStorable exists because the failure message is
+// assembled from a subprocess's own output — the fetcher puts the remote's
+// bytes straight into its error — and PostgreSQL refuses a text value holding
+// invalid UTF-8 or a NUL. Here that refusal would land on the write recording
+// the failure, so the deployment would stay in building forever with nothing
+// saying why.
+func TestEngineFailureMessagesAreStorable(t *testing.T) {
+	// Latin-1 bytes, a NUL, and enough length that the cap also has to cut
+	// somewhere — which is its own way of producing invalid UTF-8.
+	remote := "remote: caf\xe9\x00 " + strings.Repeat("x", 2000) + "→ aborting"
+
+	store := &fakeStore{jobs: []domain.DeploymentJob{testJob()}}
+	engine := newTestEngine(store, &fakeFetcher{err: errors.New(remote)}, &fakeDriver{})
+
+	if _, err := engine.processNext(context.Background()); err != nil {
+		t.Fatalf("processNext() error = %v, want nil", err)
+	}
+
+	_, logs, failure := store.snapshot()
+	if !utf8.ValidString(failure) {
+		t.Errorf("recorded failure is not valid UTF-8: %q", failure)
+	}
+	if strings.ContainsRune(failure, 0) {
+		t.Errorf("recorded failure contains a NUL byte: %q", failure)
+	}
+	// The message still has to say what went wrong.
+	if !strings.Contains(failure, "remote: caf") {
+		t.Errorf("recorded failure = %q, want it to keep the remote's message", failure)
+	}
+	for i, line := range logs {
+		if !utf8.ValidString(line) || strings.ContainsRune(line, 0) {
+			t.Errorf("log[%d] = %q, want valid UTF-8 with no NUL", i, line)
+		}
+	}
+}
+
 func TestEngineIdleQueue(t *testing.T) {
 	store := &fakeStore{}
 	engine := newTestEngine(store, &fakeFetcher{}, &fakeDriver{})
@@ -371,5 +408,84 @@ func TestLogRecorderFlushesWhenBufferFills(t *testing.T) {
 	if len(logs) < logFlushThreshold {
 		t.Errorf("only %d lines persisted before an explicit flush, want at least %d",
 			len(logs), logFlushThreshold)
+	}
+}
+
+func TestLogRecorderSanitizesBuildOutput(t *testing.T) {
+	// Build output is whatever bytes the toolchain wrote. A line PostgreSQL
+	// refuses is a line the follower never sees, and the insert is best-effort
+	// so nothing would report that it went missing.
+	store := &fakeStore{}
+	recorder := newLogRecorder(store, "deployment-1")
+
+	recorder.WriteLine("stderr", "warning: caf\xe9\x00 not found")
+	recorder.Flush()
+
+	_, logs, _ := store.snapshot()
+	if len(logs) != 1 {
+		t.Fatalf("logs = %v, want 1 line", logs)
+	}
+	if want := "stderr: warning: caf\uFFFD not found"; logs[0] != want {
+		t.Errorf("log = %q, want %q", logs[0], want)
+	}
+}
+
+func TestSanitize(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "plain text is untouched", in: "compile error on line 12", want: "compile error on line 12"},
+		{name: "valid multi-byte text is untouched", in: "erreur: café → 2", want: "erreur: café → 2"},
+		{name: "latin-1 output becomes a replacement character", in: "caf\xe9", want: "caf\uFFFD"},
+		{name: "a truncated multi-byte sequence is replaced", in: "ok\xc3(more", want: "ok\uFFFD(more"},
+		// NUL is valid UTF-8 and still rejected by PostgreSQL, so it is dropped
+		// rather than replaced: it carries no meaning worth a marker.
+		{name: "NUL is dropped", in: "before\x00after", want: "beforeafter"},
+		{name: "empty stays empty", in: "", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitize(tt.in)
+			if got != tt.want {
+				t.Errorf("sanitize(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("sanitize(%q) = %q, which is not valid UTF-8", tt.in, got)
+			}
+			if strings.ContainsRune(got, 0) {
+				t.Errorf("sanitize(%q) = %q, which still contains a NUL", tt.in, got)
+			}
+		})
+	}
+}
+
+func TestTruncateCutsOnRuneBoundary(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		max  int
+		want string
+	}{
+		{name: "shorter than the cap is returned whole", in: "short", max: 100, want: "short"},
+		{name: "exactly the cap is returned whole", in: "abcde", max: 5, want: "abcde"},
+		{name: "ascii is cut at the cap", in: "abcdef", max: 3, want: "abc…"},
+		// "abéc" is five bytes, so a cap of three lands inside the é. Cutting
+		// there would leave half a character behind.
+		{name: "a rune straddling the cap is dropped whole", in: "abéc", max: 3, want: "ab…"},
+		{name: "a cap on a rune boundary keeps the rune before it", in: "abéc", max: 4, want: "abé…"},
+		// Degenerate, but the loop must terminate rather than run off the front.
+		{name: "nothing but continuation bytes", in: "\xa9\xa9\xa9", max: 1, want: "…"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncate(tt.in, tt.max)
+			if got != tt.want {
+				t.Errorf("truncate(%q, %d) = %q, want %q", tt.in, tt.max, got, tt.want)
+			}
+		})
 	}
 }

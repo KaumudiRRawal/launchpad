@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/KaumudiRRawal/launchpad/control-plane/internal/domain"
 )
@@ -121,7 +122,7 @@ func (e *Engine) processNext(ctx context.Context) (bool, error) {
 		// and a failure that cannot be recorded leaves a deployment stuck in
 		// building forever.
 		if markErr := e.Store.MarkDeploymentFailed(context.WithoutCancel(ctx),
-			job.DeploymentID, truncate(err.Error(), 2000)); markErr != nil {
+			job.DeploymentID, truncate(sanitize(err.Error()), 2000)); markErr != nil {
 			e.Log.Error("could not record deployment failure",
 				slog.String("deployment_id", job.DeploymentID),
 				slog.String("error", markErr.Error()))
@@ -246,11 +247,31 @@ func workloadName(job domain.DeploymentJob) string {
 	return "launchpad-" + job.Subdomain
 }
 
+// sanitize makes a subprocess's output safe to store. Fetch and build output
+// is whatever bytes the remote and the toolchain happened to emit, and a
+// PostgreSQL text column accepts neither invalid UTF-8 nor a NUL byte — it
+// rejects the whole statement. Losing a log line to that would be untidy, but
+// the same bytes in a failure message are worse than untidy: the write that
+// records the failure is the one that fails, and the deployment is left in
+// building forever.
+func sanitize(s string) string {
+	return strings.ReplaceAll(strings.ToValidUTF8(s, "\uFFFD"), "\x00", "")
+}
+
+// truncate caps a message at max bytes, cutting on a rune boundary. Slicing at
+// the cap alone would split a multi-byte character in half and produce exactly
+// the invalid UTF-8 that sanitize exists to keep out of the database.
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max] + "…"
+	// Back up to the start of the rune the cap landed inside, if it landed
+	// inside one at all.
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 // logRecorder persists build output. Lines are buffered and flushed in
@@ -274,7 +295,7 @@ func newLogRecorder(store Store, deploymentID string) *logRecorder {
 // WriteLine records one line. It never returns an error: losing a log line
 // must not fail a deployment that is otherwise succeeding.
 func (r *logRecorder) WriteLine(stream, message string) {
-	for _, line := range strings.Split(strings.TrimRight(message, "\n"), "\n") {
+	for _, line := range strings.Split(strings.TrimRight(sanitize(message), "\n"), "\n") {
 		r.mu.Lock()
 		r.seq++
 		r.buffer = append(r.buffer, domain.DeploymentLog{
