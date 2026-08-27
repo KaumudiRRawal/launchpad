@@ -237,10 +237,10 @@ to 819 MB.
 **A deployment costs 16 seconds, and 15 of them are the image build.** Measured
 end to end by `make test-deploy` on an M2 Pro: fetch 0.4s, build 15.2–15.8s,
 release 0.2s, and everything the control plane itself does 0.01s. There is
-nothing worth optimising in the orchestration. There is something worth fixing
-in the build — the checkout's `.git` goes into the build context and differs on
-every fetch, so the `COPY` layer never hits the cache and an unchanged service
-recompiles from scratch. Both the numbers and that finding are in
+nothing worth optimising in the orchestration. There is something worth fixing in
+the build — its `COPY` layer misses the cache on every deployment, so unchanged
+source recompiles from scratch — but the checkout's `.git`, which looked like the
+cause, measurably is not. The numbers and how far that went are in
 [docs/architecture.md](docs/architecture.md).
 
 **Ownership is enforced in SQL, not in handlers.** Every query is scoped by
@@ -260,7 +260,11 @@ requested commit at depth 1.
 first and only then falls back to a language heuristic. If the author
 described their build, guessing instead would be both rude and wrong.
 Generated Dockerfiles are multi-stage and drop to a non-root user, because a
-platform that builds other people's code should not hand that code root.
+platform that builds other people's code should not hand that code root, and
+they exclude the checkout's `.git` — two of the three would otherwise copy the
+repository's metadata, remote URL included, into the image that gets deployed.
+A repository's own Dockerfile keeps its metadata, since it may stamp a version
+out of it.
 
 **Status transitions are enforced in the UPDATE statement.** The expected
 current status is part of the `WHERE` clause, so checking and writing are one

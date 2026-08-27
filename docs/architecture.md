@@ -225,19 +225,30 @@ the deployment live together account for 0.06% of a deployment. There is nothing
 to optimise here, and any effort spent on the control plane's speed would be
 effort spent on the wrong thing.
 
-**The warm build should be faster than it is, and the reason is measurable.**
+**The warm build should be faster than it is, and `.git` is not the reason.**
 Fifteen of those sixteen seconds are `go build` inside the image, re-running even
-though the source is byte-identical between runs. The build context is the whole
-checkout including `.git`, and `.git` differs on every fetch — a different
-packfile, a different index, a remote pointing at a different directory. So the
-`COPY . .` layer's cache key changes, and every layer after it is rebuilt.
-Confirmed directly: two repositories with identical source and different commits
-share the cache up to `COPY`, and share nothing after it.
+though the source is byte-identical between runs: the `COPY . .` layer misses the
+cache on every deployment, and every layer after it is rebuilt.
 
-Excluding `.git` from the build context would let a redeployment of unchanged
-source reuse the compile. It is not done here, because a build that reads git
-metadata to stamp its own version would break, and that deserves its own change
-with its own test rather than being smuggled in with a measurement.
+The obvious suspect was the checkout's `.git`, which goes into the build context
+and differs between fetches, and an earlier version of this document named it as
+the cause. It is not. Excluding `.git` takes a two-file repository's context from
+56.4 kB to 3.7 kB and `COPY` still misses. It still misses when the two checkouts
+are made identical down to the last mtime — verified by copying each context into
+an image and diffing every path, size, mtime, mode and owner that arrived, which
+reported no difference at all. Two plain directories with identical contents that
+git never touched *do* share the cache, so the builder is capable of it here.
+What is still different in the failing case is the excluded `.git` sitting on
+disk beside the source and the `.dockerignore` that excludes it. That is where
+the measurement stops: the cause is not established, and the fifteen seconds are
+still on the table.
+
+`.git` is excluded from generated builds anyway, for a better reason than speed.
+The Python and Node strategies copy the whole tree into the image they deploy, so
+a deployed container was shipping the repository's git metadata inside itself —
+`.git/config` names the remote it was fetched from. A repository that supplies
+its own Dockerfile keeps its metadata, because a build that stamps a version out
+of git has to keep finding it.
 
 ## What is deliberately not built
 
