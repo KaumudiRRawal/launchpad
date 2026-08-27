@@ -2,11 +2,13 @@ package deploy
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -153,6 +155,91 @@ func main() {
 			t.Errorf("found %d containers named %q, want exactly 1", got, name)
 		}
 	})
+}
+
+// TestDockerDriverGitMetadataInBuiltImage checks the exclusion against a real
+// daemon, in both directions. Whether a path reaches the image is decided by
+// Docker's reading of .dockerignore, not by ours, so nothing short of a real
+// build settles it — and the case that must keep working is the one where the
+// metadata is still there.
+func TestDockerDriverGitMetadataInBuiltImage(t *testing.T) {
+	requireDocker(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Copies the context in and does nothing else, so what the image holds is
+	// exactly what the context held.
+	const dockerfile = "FROM alpine:3.22\nCOPY . /src\n"
+
+	tests := []struct {
+		name string
+		// own writes the Dockerfile into the repository instead of generating
+		// it, which is what decides whether the metadata is dropped.
+		own     bool
+		wantGit bool
+	}{
+		{
+			name:    "generated instructions drop the metadata",
+			own:     false,
+			wantGit: false,
+		},
+		{
+			// The reason the exclusion is not unconditional: a build that
+			// stamps its version out of git has to keep finding it.
+			name:    "a repository's own Dockerfile keeps it",
+			own:     true,
+			wantGit: true,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, dir, "main.go", "package main\n\nfunc main() {}\n")
+
+			// Only the path's name reaches Docker, so a directory named .git
+			// with a file in it is the whole of what is under test.
+			if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+				t.Fatalf("create .git: %v", err)
+			}
+			writeFile(t, filepath.Join(dir, ".git"), "HEAD", "ref: refs/heads/main\n")
+
+			req := BuildRequest{
+				ContextDir: dir,
+				Dockerfile: dockerfile,
+				Tag:        fmt.Sprintf("launchpad-test/context-%d:integration", i),
+			}
+			if tt.own {
+				writeFile(t, dir, "Dockerfile", dockerfile)
+				req.Dockerfile = ""
+			}
+
+			t.Cleanup(func() { _ = exec.Command("docker", "rmi", "--force", req.Tag).Run() })
+
+			logs := &collectLogs{}
+			if _, err := (&DockerDriver{}).Build(ctx, req, logs); err != nil {
+				t.Fatalf("Build() error = %v\nlogs:\n%s", err, logs)
+			}
+
+			// Asserted against the image rather than against the presence of
+			// a .dockerignore, because a rule Docker did not apply is a rule
+			// that did nothing.
+			out, err := exec.CommandContext(ctx, "docker", "run", "--rm", req.Tag, "ls", "-a", "/src").Output()
+			if err != nil {
+				t.Fatalf("list the built context: %v", err)
+			}
+			entries := strings.Fields(string(out))
+
+			if got := slices.Contains(entries, ".git"); got != tt.wantGit {
+				t.Errorf("image contains .git = %v, want %v (contents: %v)", got, tt.wantGit, entries)
+			}
+			// Guards against passing because the context was empty.
+			if !slices.Contains(entries, "main.go") {
+				t.Errorf("image is missing the source it was built from (contents: %v)", entries)
+			}
+		})
+	}
 }
 
 // TestGitFetcherFetchesSingleCommit verifies the shallow fetch against a real

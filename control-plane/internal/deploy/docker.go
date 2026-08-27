@@ -2,9 +2,13 @@ package deploy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -44,6 +48,12 @@ func (d *DockerDriver) Build(ctx context.Context, req BuildRequest, logs LogWrit
 		// piped in and the context directory supplies the source.
 		args = append(args, "--file", "-")
 		stdin = strings.NewReader(req.Dockerfile)
+
+		// Safe here and only here: these instructions are ours, so we know
+		// what they read.
+		if err := excludeGitMetadata(req.ContextDir); err != nil {
+			return BuildResult{}, err
+		}
 	}
 	args = append(args, req.ContextDir)
 
@@ -51,6 +61,56 @@ func (d *DockerDriver) Build(ctx context.Context, req BuildRequest, logs LogWrit
 		return BuildResult{}, err
 	}
 	return BuildResult{Image: req.Tag}, nil
+}
+
+// excludeGitMetadata keeps the checkout's .git directory out of the build
+// context.
+//
+// The Python and Node strategies copy the whole source tree into the image they
+// deploy, so without this a deployed container ships the repository's git
+// metadata inside itself: .git/config naming the remote, and the object store
+// holding the fetched commit. A platform that builds other people's code should
+// not put their repository inside the thing it exposes to the internet. It also
+// keeps a repository's entire .git from being uploaded to the daemon on every
+// single build.
+//
+// What it does not do is repair the layer cache, which is why it was originally
+// wanted. A second checkout of the same commit still misses on COPY with the
+// metadata gone, so .git was not what was invalidating it; docs/architecture.md
+// carries that measurement.
+//
+// It runs only for a generated Dockerfile, which is the only case where dropping
+// the metadata is known to be safe. A repository that wrote its own build may
+// stamp a version out of git, and breaking that build would be trading someone
+// else's correctness for the platform's tidiness.
+//
+// A .dockerignore in the context root is the only way to exclude a path from a
+// docker build, so the rule is appended to whatever the repository already had
+// rather than replacing it. Those rules were written for a build of this same
+// source and may be excluding something for a reason; appending also puts ours
+// last, where a pattern above it cannot re-include the metadata.
+func excludeGitMetadata(contextDir string) error {
+	if _, err := os.Stat(filepath.Join(contextDir, ".git")); err != nil {
+		// Nothing to exclude. A service built from a subdirectory of a
+		// monorepo never had the metadata in its context to begin with.
+		return nil
+	}
+
+	path := filepath.Join(contextDir, ".dockerignore")
+	rules, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("read .dockerignore: %w", err)
+	}
+
+	if len(rules) > 0 && !strings.HasSuffix(string(rules), "\n") {
+		rules = append(rules, '\n')
+	}
+	rules = append(rules, ".git\n"...)
+
+	if err := os.WriteFile(path, rules, 0o644); err != nil {
+		return fmt.Errorf("write .dockerignore: %w", err)
+	}
+	return nil
 }
 
 // Release starts the image, replacing any workload already using the name.
