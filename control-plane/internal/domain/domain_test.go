@@ -265,3 +265,50 @@ func TestDeploymentStatusTerminal(t *testing.T) {
 		}
 	}
 }
+
+// TestPublicURL pins the port rule. The only reason this function is not string
+// concatenation is that a port has to disappear from the URL when it is the
+// scheme's default, and every install that is not a laptop runs the proxy on
+// 80 — so the branch nobody exercises locally is the one every real user sees.
+func TestPublicURL(t *testing.T) {
+	tests := []struct {
+		name       string
+		baseDomain string
+		port       int
+		subdomain  string
+		want       string
+	}{
+		{
+			name:       "names a non-default port",
+			baseDomain: "localhost",
+			port:       8081,
+			subdomain:  "pr-42-demo",
+			want:       "http://pr-42-demo.localhost:8081",
+		},
+		{
+			name:       "elides the scheme default",
+			baseDomain: "launchpad.dev",
+			port:       80,
+			subdomain:  "production-demo",
+			want:       "http://production-demo.launchpad.dev",
+		},
+		{
+			// Config.ProxyPort() returns 0 when the proxy address carries no
+			// port, which means the default one rather than a port zero.
+			name:       "elides an unset port",
+			baseDomain: "launchpad.dev",
+			port:       0,
+			subdomain:  "production-demo",
+			want:       "http://production-demo.launchpad.dev",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := PublicURL(tt.baseDomain, tt.port, tt.subdomain); got != tt.want {
+				t.Errorf("PublicURL(%q, %d, %q) = %q, want %q",
+					tt.baseDomain, tt.port, tt.subdomain, got, tt.want)
+			}
+		})
+	}
+}
