@@ -299,3 +299,106 @@ func TestAPIKeyLifecycle(t *testing.T) {
 		}
 	})
 }
+
+// TestProjectContentsAreScopedToTheAccount covers the queries that read what
+// is inside a project. Each of them reaches the account by joining through
+// projects and filtering there, so losing that join would hand another
+// account's services, environments and deployments to anyone who learned a
+// project ID — and every handler test would still pass, because the handlers
+// are exercised against a fake store and never run this SQL.
+func TestProjectContentsAreScopedToTheAccount(t *testing.T) {
+	repo, pool := newTestRepo(t)
+	ctx := context.Background()
+
+	owner := newAccount(t, repo, "contents-owner")
+	intruder := newAccount(t, repo, "contents-intruder")
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = ANY($1)`,
+			[]string{owner.ID, intruder.ID})
+	})
+
+	project, err := repo.CreateProject(ctx, owner.ID, domain.CreateProjectInput{
+		Slug: "contents", Name: "Contents",
+		RepoURL: "https://github.com/example/contents", DefaultBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+
+	service, err := repo.CreateService(ctx, owner.ID, project.ID,
+		domain.CreateServiceInput{Name: "api", SourcePath: ".", Port: 8080})
+	if err != nil {
+		t.Fatalf("CreateService() error = %v", err)
+	}
+
+	// Subdomains are unique across the whole platform, not per project, so a
+	// literal here would collide with whatever an earlier run left behind.
+	environment, err := repo.CreateEnvironment(ctx, owner.ID, project.ID,
+		domain.CreateEnvironmentInput{Kind: domain.EnvironmentProduction, Name: "production"},
+		fmt.Sprintf("production-contents-%d", time.Now().UnixNano()))
+	if err != nil {
+		t.Fatalf("CreateEnvironment() error = %v", err)
+	}
+
+	if _, err := repo.CreateDeployment(ctx, owner.ID, domain.CreateDeploymentInput{
+		ServiceID:     service.ID,
+		EnvironmentID: environment.ID,
+		CommitSHA:     "0123456789abcdef0123456789abcdef01234567",
+	}); err != nil {
+		t.Fatalf("CreateDeployment() error = %v", err)
+	}
+
+	// Each list takes the same two identifiers and, for a project the caller
+	// does not own, must come back empty rather than not found: the project ID
+	// is the caller's own input, and answering "no such project" would confirm
+	// that someone else's project exists.
+	lists := []struct {
+		name  string
+		count func(accountID string) (int, error)
+	}{
+		{"services", func(accountID string) (int, error) {
+			got, err := repo.ListServices(ctx, accountID, project.ID)
+			return len(got), err
+		}},
+		{"environments", func(accountID string) (int, error) {
+			got, err := repo.ListEnvironments(ctx, accountID, project.ID)
+			return len(got), err
+		}},
+		{"deployments", func(accountID string) (int, error) {
+			got, err := repo.ListDeployments(ctx, accountID, project.ID)
+			return len(got), err
+		}},
+	}
+
+	for _, tt := range lists {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.count(owner.ID)
+			if err != nil {
+				t.Fatalf("listing %s as owner error = %v", tt.name, err)
+			}
+			if got != 1 {
+				t.Errorf("owner sees %d %s, want 1", got, tt.name)
+			}
+
+			got, err = tt.count(intruder.ID)
+			if err != nil {
+				t.Fatalf("listing %s as intruder error = %v, want nil", tt.name, err)
+			}
+			if got != 0 {
+				t.Errorf("intruder sees %d %s, want 0", got, tt.name)
+			}
+		})
+	}
+
+	// GetEnvironment is the lookup behind the metrics and analysis endpoints,
+	// which are addressed by environment ID alone and so never pass through a
+	// project the caller was shown.
+	t.Run("environment by id", func(t *testing.T) {
+		if _, err := repo.GetEnvironment(ctx, owner.ID, environment.ID); err != nil {
+			t.Errorf("GetEnvironment() as owner error = %v, want nil", err)
+		}
+		if _, err := repo.GetEnvironment(ctx, intruder.ID, environment.ID); !errors.Is(err, domain.ErrNotFound) {
+			t.Errorf("GetEnvironment() as intruder error = %v, want ErrNotFound", err)
+		}
+	})
+}
