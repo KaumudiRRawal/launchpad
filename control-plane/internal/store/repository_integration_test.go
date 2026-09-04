@@ -300,6 +300,118 @@ func TestAPIKeyLifecycle(t *testing.T) {
 	})
 }
 
+// TestListingAPIKeysIsScopedToTheAccount covers the one query in the API-key
+// surface that returns a set rather than a single row. Its WHERE clause is all
+// that stands between an account and the metadata of everyone else's
+// credentials — how many they hold, what they named them, and when each was
+// last used. The handler tests run against a fake store and never execute this
+// SQL, so without this the clause could be dropped and every other test would
+// still pass.
+func TestListingAPIKeysIsScopedToTheAccount(t *testing.T) {
+	repo, pool := newTestRepo(t)
+	ctx := context.Background()
+
+	owner := newAccount(t, repo, "lister")
+	intruder := newAccount(t, repo, "lister-intruder")
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = ANY($1)`,
+			[]string{owner.ID, intruder.ID})
+	})
+
+	older, _, err := repo.CreateAPIKey(ctx, owner.ID, "laptop")
+	if err != nil {
+		t.Fatalf("CreateAPIKey() error = %v", err)
+	}
+	newer, _, err := repo.CreateAPIKey(ctx, owner.ID, "CI")
+	if err != nil {
+		t.Fatalf("CreateAPIKey() error = %v", err)
+	}
+	theirs, _, err := repo.CreateAPIKey(ctx, intruder.ID, "theirs")
+	if err != nil {
+		t.Fatalf("CreateAPIKey() error = %v", err)
+	}
+
+	t.Run("returns the account's own keys, newest first", func(t *testing.T) {
+		keys, err := repo.ListAPIKeys(ctx, owner.ID)
+		if err != nil {
+			t.Fatalf("ListAPIKeys() error = %v", err)
+		}
+		if len(keys) != 2 {
+			t.Fatalf("got %d keys, want this account's 2: %+v", len(keys), keys)
+		}
+		if keys[0].ID != newer.ID || keys[1].ID != older.ID {
+			t.Errorf("listed %q then %q, want the most recently created first",
+				keys[0].Name, keys[1].Name)
+		}
+		// The prefix identifies a key in the dashboard, and it is scanned out
+		// of the column next to the name, so a listing that mixed the two up
+		// would still return two strings and look right.
+		if keys[0].TokenPrefix != newer.TokenPrefix {
+			t.Errorf("TokenPrefix = %q, want %q", keys[0].TokenPrefix, newer.TokenPrefix)
+		}
+	})
+
+	t.Run("another account's keys are not among them", func(t *testing.T) {
+		keys, err := repo.ListAPIKeys(ctx, intruder.ID)
+		if err != nil {
+			t.Fatalf("ListAPIKeys() error = %v", err)
+		}
+		if len(keys) != 1 || keys[0].ID != theirs.ID {
+			t.Fatalf("got %+v, want only this account's own key", keys)
+		}
+	})
+
+	t.Run("a revoked key stays in the list", func(t *testing.T) {
+		// Revoking is not deleting. The list exists to say which credentials
+		// were issued and which have been turned off, and a key that vanished
+		// on revocation would be indistinguishable from one never created.
+		if err := repo.RevokeAPIKey(ctx, owner.ID, older.ID); err != nil {
+			t.Fatalf("RevokeAPIKey() error = %v", err)
+		}
+
+		keys, err := repo.ListAPIKeys(ctx, owner.ID)
+		if err != nil {
+			t.Fatalf("ListAPIKeys() error = %v", err)
+		}
+		if len(keys) != 2 {
+			t.Fatalf("got %d keys after revoking one, want 2: %+v", len(keys), keys)
+		}
+		for _, k := range keys {
+			switch k.ID {
+			case older.ID:
+				if k.RevokedAt == nil {
+					t.Error("the revoked key came back with no revoked_at")
+				}
+			case newer.ID:
+				if k.RevokedAt != nil {
+					t.Error("revoking one key marked the other revoked too")
+				}
+			}
+		}
+	})
+
+	t.Run("an account holding no keys gets an empty list", func(t *testing.T) {
+		// The handler encodes the result straight into the response body,
+		// where a nil slice would become null and make an account with no keys
+		// a special case for every client that reads it.
+		keyless := newAccount(t, repo, "keyless")
+		t.Cleanup(func() {
+			_, _ = pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = $1`, keyless.ID)
+		})
+
+		keys, err := repo.ListAPIKeys(ctx, keyless.ID)
+		if err != nil {
+			t.Fatalf("ListAPIKeys() error = %v", err)
+		}
+		if keys == nil {
+			t.Error("ListAPIKeys() = nil, want an empty slice")
+		}
+		if len(keys) != 0 {
+			t.Errorf("got %d keys for an account that holds none: %+v", len(keys), keys)
+		}
+	})
+}
+
 // TestProjectContentsAreScopedToTheAccount covers the queries that read what
 // is inside a project. Each of them reaches the account by joining through
 // projects and filtering there, so losing that join would hand another
