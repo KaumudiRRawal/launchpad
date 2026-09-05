@@ -217,6 +217,58 @@ func TestCreateDeploymentInputValidate(t *testing.T) {
 	})
 }
 
+func TestCreateAPIKeyInputValidate(t *testing.T) {
+	tests := []struct {
+		name  string
+		in    CreateAPIKeyInput
+		valid bool
+	}{
+		{name: "named", in: CreateAPIKeyInput{Name: "ci"}, valid: true},
+		{name: "at the length limit", in: CreateAPIKeyInput{Name: strings.Repeat("k", 200)}, valid: true},
+		{name: "missing", in: CreateAPIKeyInput{}, valid: false},
+		{name: "only whitespace", in: CreateAPIKeyInput{Name: "   "}, valid: false},
+		{name: "past the length limit", in: CreateAPIKeyInput{Name: strings.Repeat("k", 201)}, valid: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.in.Validate()
+			if tt.valid {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("Validate() = nil, want an error")
+			}
+
+			// The 422 body names the field to correct, and this input has
+			// exactly one field a caller could have got wrong.
+			var problems ValidationErrors
+			if !errors.As(err, &problems) {
+				t.Fatalf("Validate() returned %T, want ValidationErrors", err)
+			}
+			if len(problems) != 1 || problems[0].Field != "name" {
+				t.Errorf("got %v, want one problem naming name", problems)
+			}
+		})
+	}
+
+	t.Run("trims the name before it is stored", func(t *testing.T) {
+		// The handler hands the normalised input straight to CreateAPIKey, so
+		// whatever Validate leaves behind is the name an operator reads later
+		// when deciding which key to revoke.
+		in := CreateAPIKeyInput{Name: "  ci deploy  "}
+		if err := in.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want nil", err)
+		}
+		if in.Name != "ci deploy" {
+			t.Errorf("Name = %q, want %q", in.Name, "ci deploy")
+		}
+	})
+}
+
 func TestDeploymentStatusTransitions(t *testing.T) {
 	tests := []struct {
 		from, to DeploymentStatus
