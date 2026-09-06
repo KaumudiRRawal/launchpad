@@ -462,3 +462,52 @@ func TestAnElevatedFailureRateWithNoBaselineSaysSo(t *testing.T) {
 		t.Errorf("Detail does not say the baseline was silent: %q", finding.Detail)
 	}
 }
+
+// TestFindingsTiedOnTrafficRankTheCriticalOneFirst covers the tie-break in the
+// finding order. Both findings are rated by a count of requests over the same
+// window, so two of them landing on the same figure is not a contrived case —
+// and when it happens the order decides which sentence the report leads with,
+// because the verdict's detail is the first finding's summary.
+//
+// The traffic below is arranged so the warning is detected first and has to be
+// moved: 300 requests in the window, 90 of them slower than the baseline's p95
+// (75 above the 5% a p95 allows for) and 75 of them failing, which is 300 an
+// hour either way.
+func TestFindingsTiedOnTrafficRankTheCriticalOneFirst(t *testing.T) {
+	r := report(
+		// A steady 25% failure rate before the window as well, so the rise is
+		// zero and this reads as an environment that was already failing
+		// rather than as a reliability regression.
+		traffic(baseStart, 60, oldCommit, oldCommit, 5, repeat(200, 20)),
+		traffic(currentStart, 15, newCommit, newCommit, 5,
+			append(repeat(100, 14), repeat(300, 6)...)),
+	)
+
+	if got := codes(r); len(got) != 2 {
+		t.Fatalf("findings = %v, want exactly the failure rate and the latency regression", got)
+	}
+
+	latency, _ := find(r, CodeLatencyRegression)
+	failures, _ := find(r, CodeElevatedFailureRate)
+	if latency.AffectedRequestsPerHour != failures.AffectedRequestsPerHour {
+		t.Fatalf("the two findings affect %v and %v requests an hour; this test only says anything while they tie",
+			latency.AffectedRequestsPerHour, failures.AffectedRequestsPerHour)
+	}
+	if latency.Severity != SeverityWarning || failures.Severity != SeverityCritical {
+		t.Fatalf("severities are %q latency / %q failures, want warning / critical",
+			latency.Severity, failures.Severity)
+	}
+
+	if r.Findings[0].Code != CodeElevatedFailureRate {
+		t.Errorf("led with %q; a tie on affected traffic belongs to the critical finding",
+			r.Findings[0].Code)
+	}
+	if r.Detail != failures.Summary {
+		t.Errorf("Detail = %q, want the leading finding's summary %q", r.Detail, failures.Summary)
+	}
+	// The steps inherit their finding's order, so ranking the findings ranks
+	// the work as well.
+	if len(r.Remediations) == 0 || r.Remediations[0].Finding != CodeElevatedFailureRate {
+		t.Errorf("remediations = %v, want the failing requests addressed first", r.Remediations)
+	}
+}
