@@ -200,9 +200,9 @@ func TestSeriesFoldsDeploymentsIntoOneLinePerMinute(t *testing.T) {
 	// A release lands mid-window, so one minute has two deployments in it. The
 	// series is about the environment, not about either deployment.
 	buckets := []domain.MetricBucket{
-		{DeploymentID: "new", Bucket: at.Add(time.Minute), Requests: 5, Histogram: observe(repeat(10, 5)...)},
-		{DeploymentID: "old", Bucket: at, Requests: 10, Failures: 1, Histogram: observe(repeat(10, 10)...)},
-		{DeploymentID: "new", Bucket: at, Requests: 4, Histogram: observe(repeat(10, 4)...)},
+		{DeploymentID: "new", Bucket: at.Add(time.Minute), Requests: 5, LatencyMaxMS: 10, Histogram: observe(repeat(10, 5)...)},
+		{DeploymentID: "old", Bucket: at, Requests: 10, Failures: 1, LatencyMaxMS: 10, Histogram: observe(repeat(10, 10)...)},
+		{DeploymentID: "new", Bucket: at, Requests: 4, LatencyMaxMS: 10, Histogram: observe(repeat(10, 4)...)},
 	}
 
 	points := Series(buckets)
@@ -220,6 +220,44 @@ func TestSeriesFoldsDeploymentsIntoOneLinePerMinute(t *testing.T) {
 	}
 	if points[1].Requests != 5 {
 		t.Errorf("second point = %d requests, want 5", points[1].Requests)
+	}
+}
+
+// TestSeriesPercentileNeverExceedsTheMinutesMaximum is the artefact
+// TestPercentilesNeverExceedTheObservedMaximum pins for a whole window,
+// applied to one minute of it. The series is the thinner of the two — a
+// window's traffic divided by the minutes in it — so a minute holding a couple
+// of slow requests in one wide bucket is its common case rather than its edge
+// case, and the chart is where a point above anything that happened is most
+// visible.
+func TestSeriesPercentileNeverExceedsTheMinutesMaximum(t *testing.T) {
+	at := time.Date(2026, 8, 21, 10, 0, 0, 0, time.UTC)
+
+	histogram := NewHistogram()
+	for range 8 {
+		histogram.Observe(1)
+	}
+	// Two requests just inside the 300-500ms bucket, so interpolation puts the
+	// 95th percentile three quarters of the way up it.
+	for range 2 {
+		histogram.Observe(310)
+	}
+
+	points := Series([]domain.MetricBucket{{
+		Bucket: at, Requests: 10, LatencyMaxMS: 310, Histogram: histogram,
+	}})
+
+	if len(points) != 1 {
+		t.Fatalf("Series() returned %d points, want 1", len(points))
+	}
+	if points[0].LatencyP95MS > 310 {
+		t.Errorf("p95 = %v in a minute whose slowest request took 310ms",
+			points[0].LatencyP95MS)
+	}
+	// Still a reading of the slow end, not flattened onto the median.
+	if points[0].LatencyP95MS <= 1 {
+		t.Errorf("p95 = %v, want it above the millisecond bucket the bulk of the traffic was in",
+			points[0].LatencyP95MS)
 	}
 }
 

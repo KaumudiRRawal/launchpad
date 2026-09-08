@@ -51,6 +51,7 @@ func Series(buckets []domain.MetricBucket) []domain.MetricPoint {
 	type minute struct {
 		requests  int64
 		failures  int64
+		maxMS     float64
 		histogram Histogram
 	}
 
@@ -67,6 +68,7 @@ func Series(buckets []domain.MetricBucket) []domain.MetricPoint {
 		}
 		m.requests += b.Requests
 		m.failures += b.Failures
+		m.maxMS = max(m.maxMS, b.LatencyMaxMS)
 		m.histogram.Add(b.Histogram)
 	}
 
@@ -76,10 +78,17 @@ func Series(buckets []domain.MetricBucket) []domain.MetricPoint {
 	for _, at := range order {
 		m := byMinute[at]
 		points = append(points, domain.MetricPoint{
-			Bucket:       time.Unix(at, 0).UTC(),
-			Requests:     m.requests,
-			Failures:     m.failures,
-			LatencyP95MS: m.histogram.Quantile(0.95),
+			Bucket:   time.Unix(at, 0).UTC(),
+			Requests: m.requests,
+			Failures: m.failures,
+			// Capped at the minute's own slowest request, for the reason
+			// Summarize caps the window's percentiles: a minute holding a
+			// handful of requests in one wide bucket interpolates to near the
+			// top of it, and this is the thinner of the two series — a whole
+			// window's traffic divided by the minutes in it. The chart is
+			// where that artefact is most visible, and a point above anything
+			// that happened is one an operator cannot act on.
+			LatencyP95MS: min(m.histogram.Quantile(0.95), m.maxMS),
 		})
 	}
 	return points
