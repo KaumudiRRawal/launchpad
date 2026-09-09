@@ -258,3 +258,67 @@ func TestPruneMetricsDropsWhatIsPastRetention(t *testing.T) {
 		t.Errorf("read back %+v, want only the recent minute", buckets)
 	}
 }
+
+// TestEnvironmentMetricsKeepsTheNewestRowsWhenCapped pins which end of the
+// range the row cap eats.
+//
+// EnvironmentMetrics is not paged: a caller asks for a window and gets what
+// fits. So when a busy environment has more minutes in the window than the cap
+// allows, the rows that have to go are the oldest ones. Dropping the newest
+// instead would empty the current window while leaving the baseline intact,
+// and the analysis would answer "insufficient data" about an environment
+// taking more traffic than any other.
+func TestEnvironmentMetricsKeepsTheNewestRowsWhenCapped(t *testing.T) {
+	repo, pool := newTestRepo(t)
+	ctx := context.Background()
+
+	m := newMeasured(t, repo, "capped")
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = $1`, m.account.ID)
+	})
+
+	// Comfortably past the cap the query applies, inserted directly because
+	// this test is about how many rows come back rather than how they got in.
+	const minutes = 5100
+
+	newest := time.Now().UTC().Truncate(time.Minute)
+	oldest := newest.Add(-(minutes - 1) * time.Minute)
+
+	histogram := metrics.NewHistogram()
+	histogram.Observe(10)
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO deployment_metrics (deployment_id, environment_id, bucket,
+			requests, failures, latency_sum_ms, latency_max_ms, histogram)
+		SELECT $1, $2, $3::timestamptz - make_interval(mins => n), 1, 0, 10, 10, $5
+		FROM generate_series(0, $4::int) AS n`,
+		m.deployment.ID, m.environment.ID, newest, minutes-1, []int64(histogram))
+	if err != nil {
+		t.Fatalf("seed metrics: %v", err)
+	}
+
+	buckets, err := repo.EnvironmentMetrics(ctx, m.account.ID, m.environment.ID, oldest)
+	if err != nil {
+		t.Fatalf("EnvironmentMetrics() error = %v", err)
+	}
+	if len(buckets) == 0 {
+		t.Fatal("EnvironmentMetrics() returned nothing")
+	}
+	if len(buckets) >= minutes {
+		t.Fatalf("read back %d of %d rows; the cap did not apply, so this test proves nothing",
+			len(buckets), minutes)
+	}
+
+	// The minute just gone is the one someone watching a deploy is looking at.
+	if got := buckets[len(buckets)-1].Bucket; !got.Equal(newest) {
+		t.Errorf("newest row = %v, want %v — the cap dropped the recent end of the window", got, newest)
+	}
+	if got := buckets[0].Bucket; got.Equal(oldest) {
+		t.Errorf("oldest row = %v, want the cap to have dropped it", got)
+	}
+	// Still the order every caller reads them in.
+	if !buckets[0].Bucket.Before(buckets[len(buckets)-1].Bucket) {
+		t.Errorf("rows are not oldest first: %v then %v",
+			buckets[0].Bucket, buckets[len(buckets)-1].Bucket)
+	}
+}
