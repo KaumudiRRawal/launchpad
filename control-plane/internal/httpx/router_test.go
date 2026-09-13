@@ -109,3 +109,28 @@ func TestPanicBecomesInternalError(t *testing.T) {
 		t.Errorf("status = %d, want 500", rec.Code)
 	}
 }
+
+// TestObservabilityKeepsTheWriterFlushable guards the Unwrap on the status
+// recorder. Every route is mounted behind this middleware, and a wrapper that
+// hides the real writer takes flushing away from all of them at once —
+// silently, because http.ResponseController reports a writer it cannot reach
+// as an error a handler is free to ignore rather than as a panic.
+func TestObservabilityKeepsTheWriterFlushable(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	var flushErr error
+	handler := WithObservability(log)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "first\n")
+		flushErr = http.NewResponseController(w).Flush()
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stream", nil))
+
+	if flushErr != nil {
+		t.Errorf("Flush() through the middleware = %v, want nil", flushErr)
+	}
+	if !rec.Flushed {
+		t.Error("flush did not reach the underlying writer")
+	}
+}

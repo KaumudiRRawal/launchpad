@@ -108,8 +108,11 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	return s.ResponseWriter.Write(b)
 }
 
-// Unwrap lets http.ResponseController reach the underlying writer, which the
-// deployment log stream needs for flushing.
+// Unwrap keeps the writer this wrapper hides reachable through
+// http.ResponseController. Embedding the interface promotes only its three
+// methods, so without this every route — they all sit behind this middleware —
+// would quietly lose flushing and hijacking: ResponseController reports a
+// writer it cannot reach as an error, not a panic.
 func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 func newRequestID() string {
