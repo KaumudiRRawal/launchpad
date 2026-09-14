@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -164,10 +165,20 @@ func (d *DockerDriver) publishedPort(ctx context.Context, name string, container
 		return "", fmt.Errorf("read published port: %w", err)
 	}
 
-	// Output looks like "0.0.0.0:32770" and may list several bindings.
+	// Output is one binding per line, "0.0.0.0:32770". A daemon with IPv6
+	// enabled prints "[::]:32770" beside it, and prints only that one when the
+	// binding is IPv6-only. The port is therefore whatever follows the *last*
+	// colon: cutting at the first reads "[::]:32770" as a port of ":]:32770".
 	first, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n")
-	_, port, found := strings.Cut(strings.TrimSpace(first), ":")
-	if !found || port == "" {
+	first = strings.TrimSpace(first)
+
+	// LastIndex is -1 when the line carries no colon at all, which leaves the
+	// whole of it to fail the check below.
+	port := first[strings.LastIndex(first, ":")+1:]
+	if _, err := strconv.Atoi(port); err != nil {
+		// Refusing a line we cannot read beats releasing on a made-up port.
+		// The environment's URL is built from this, so guessing here produces
+		// an address that never answers and never says why.
 		return "", fmt.Errorf("could not parse published port from %q", first)
 	}
 	return port, nil
