@@ -2,6 +2,8 @@ package deploy
 
 import (
 	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -40,13 +42,41 @@ func streamCommand(cmd *exec.Cmd, logs LogWriter) error {
 	return cmd.Wait()
 }
 
-func scan(r io.Reader, stream string, logs LogWriter) {
-	scanner := bufio.NewScanner(r)
-	// Build output can carry very long lines; the default 64 KiB limit would
-	// abort the scan and silently truncate the log.
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+// maxLogLine is the longest line recorded in one piece. Build output can carry
+// very long ones — a bundler's manifest, a base64 blob echoed by a RUN step —
+// and anything past the cap continues on the following line.
+const maxLogLine = 64 * 1024
 
-	for scanner.Scan() {
-		logs.WriteLine(stream, scanner.Text())
+// scan sends r to logs one line at a time.
+//
+// Cutting an over-long line into pieces is the whole reason this is not a
+// bufio.Scanner, whose answer to a line longer than its buffer is to stop
+// scanning: every line the command went on to emit would be dropped without a
+// word, which is worst in exactly the case that produces enormous lines — a
+// build that is about to fail and explain itself. Because nothing is lost now,
+// the cap only decides how output is divided rather than how much of it
+// survives, so it can be a buffer small enough to allocate per command.
+func scan(r io.Reader, stream string, logs LogWriter) {
+	reader := bufio.NewReaderSize(r, maxLogLine)
+
+	for {
+		line, err := reader.ReadSlice('\n')
+		// ReadSlice returns what it read alongside the error, so a command whose
+		// last line had no terminator still has that line recorded.
+		if len(line) > 0 {
+			logs.WriteLine(stream, string(trimEOL(line)))
+		}
+		// A line too long for the buffer comes back as ErrBufferFull, with the
+		// remainder of it waiting for the next read.
+		if err != nil && !errors.Is(err, bufio.ErrBufferFull) {
+			return
+		}
 	}
+}
+
+// trimEOL drops one line terminator, a CRLF included, exactly as bufio's own
+// line splitter does. A bare carriage return is left alone: the vendor CLIs
+// redraw progress with it, so it is content rather than a line ending.
+func trimEOL(line []byte) []byte {
+	return bytes.TrimSuffix(bytes.TrimSuffix(line, []byte("\n")), []byte("\r"))
 }
