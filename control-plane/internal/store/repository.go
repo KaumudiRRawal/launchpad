@@ -68,20 +68,6 @@ func (r *Repository) CreateAccount(ctx context.Context, email, name string) (dom
 	return a, nil
 }
 
-func (r *Repository) GetAccount(ctx context.Context, id string) (domain.Account, error) {
-	const query = `
-		SELECT id, email, name, created_at, updated_at
-		FROM accounts WHERE id = $1`
-
-	var a domain.Account
-	err := r.pool.QueryRow(ctx, query, id).
-		Scan(&a.ID, &a.Email, &a.Name, &a.CreatedAt, &a.UpdatedAt)
-	if err != nil {
-		return domain.Account{}, fmt.Errorf("get account: %w", translate(err))
-	}
-	return a, nil
-}
-
 // --- Projects ---
 
 func (r *Repository) CreateProject(ctx context.Context, accountID string, in domain.CreateProjectInput) (domain.Project, error) {
