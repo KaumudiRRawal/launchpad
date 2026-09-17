@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -314,10 +315,16 @@ func (f *fakeStore) RevokeAPIKey(_ context.Context, accountID, id string) error 
 }
 
 func newAPI(store Store) http.Handler {
+	return newAPILoggingTo(store, io.Discard)
+}
+
+// newAPILoggingTo is newAPI with the request log captured, for the cases that
+// assert what an operator is left with rather than what the caller is told.
+func newAPILoggingTo(store Store, logTo io.Writer) http.Handler {
 	api := &API{
 		DB:         stubPinger{},
 		Store:      store,
-		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Log:        slog.New(slog.NewJSONHandler(logTo, nil)),
 		Version:    "test",
 		BaseDomain: testBaseDomain,
 		ProxyPort:  testProxyPort,
@@ -514,6 +521,56 @@ func TestCreateProject(t *testing.T) {
 			t.Errorf("second create: status = %d, want 409", rec.Code)
 		}
 	})
+}
+
+func TestUnmappableStoreErrorIsLoggedRatherThanReturned(t *testing.T) {
+	// A store failure the handler cannot classify is the one case where the
+	// underlying text is both useless to the caller and necessary to whoever
+	// is on call: a driver error carries credentials, table names and the
+	// contents of the row that upset it. So it goes to the log, and the caller
+	// gets the request ID that finds that log line — the claim Error() makes
+	// about tracing a reported failure only holds if both halves are true.
+	store := newFakeStore()
+	store.createErr = errors.New(`pq: password authentication failed for user "launchpad"`)
+
+	var logged bytes.Buffer
+	srv := newAPILoggingTo(store, &logged)
+
+	rec := request(t, srv, http.MethodPost, "/v1/projects", testToken, map[string]any{
+		"slug":     "demo",
+		"name":     "Demo",
+		"repo_url": "https://github.com/example/demo",
+	})
+	payload := rec.Body.String()
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body: %s)", rec.Code, payload)
+	}
+
+	var body ErrorBody
+	if err := json.Unmarshal([]byte(payload), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Error.Code != "internal_error" {
+		t.Errorf("code = %q, want internal_error", body.Error.Code)
+	}
+	if strings.Contains(payload, "password authentication") {
+		t.Errorf("response leaked the store error: %s", payload)
+	}
+
+	if body.Error.RequestID == "" {
+		t.Fatal("500 response carries no request_id, so the log line cannot be found")
+	}
+	if got := rec.Header().Get(RequestIDHeader); got != body.Error.RequestID {
+		t.Errorf("%s = %q, want the body's %q", RequestIDHeader, got, body.Error.RequestID)
+	}
+
+	if !strings.Contains(logged.String(), "password authentication") {
+		t.Errorf("store error never reached the log: %s", logged.String())
+	}
+	if !strings.Contains(logged.String(), body.Error.RequestID) {
+		t.Errorf("log does not mention request_id %q: %s", body.Error.RequestID, logged.String())
+	}
 }
 
 func TestProjectsAreScopedToTheAccount(t *testing.T) {
