@@ -608,3 +608,120 @@ func TestDeploymentLogsFollowACursor(t *testing.T) {
 		}
 	})
 }
+
+// TestSupersedePriorDeploymentsRetiresOnlyWhatOneReleaseReplaces pins the
+// scope of the retirement. The engine calls this after every successful
+// release, so the WHERE clause is the only thing standing between a redeploy
+// of one service and the live deployments legitimately belonging to its
+// siblings and to the project's other environments — a monorepo's production
+// environment holds one live deployment per service, not one in total.
+func TestSupersedePriorDeploymentsRetiresOnlyWhatOneReleaseReplaces(t *testing.T) {
+	f := newDeploymentFixture(t, "supersede")
+	ctx := context.Background()
+
+	sibling, err := f.repo.CreateService(ctx, f.account.ID, f.service.ProjectID,
+		domain.CreateServiceInput{Name: "web", SourcePath: "services/web", Port: 3000})
+	if err != nil {
+		t.Fatalf("CreateService() error = %v", err)
+	}
+
+	// A preview of the same service. Only one production environment per
+	// project is allowed, so the second environment has to be a preview —
+	// which is the pairing that matters anyway.
+	preview, err := f.repo.CreateEnvironment(ctx, f.account.ID, f.service.ProjectID,
+		domain.CreateEnvironmentInput{Kind: domain.EnvironmentPreview, Name: "pr-1"},
+		"preview-supersede")
+	if err != nil {
+		t.Fatalf("CreateEnvironment() error = %v", err)
+	}
+
+	// release walks a fresh deployment all the way to live, which is the only
+	// status this statement is allowed to retire.
+	release := func(t *testing.T, serviceID, environmentID string, n int) string {
+		t.Helper()
+
+		d, err := f.repo.CreateDeployment(ctx, f.account.ID, domain.CreateDeploymentInput{
+			ServiceID: serviceID, EnvironmentID: environmentID,
+			CommitSHA: fmt.Sprintf("%040x", n),
+		})
+		if err != nil {
+			t.Fatalf("CreateDeployment(%d) error = %v", n, err)
+		}
+		for _, step := range []struct{ from, to domain.DeploymentStatus }{
+			{domain.DeploymentQueued, domain.DeploymentBuilding},
+			{domain.DeploymentBuilding, domain.DeploymentDeploying},
+		} {
+			if err := f.repo.TransitionDeployment(ctx, d.ID, step.from, step.to); err != nil {
+				t.Fatalf("TransitionDeployment(%d, %s->%s) error = %v", n, step.from, step.to, err)
+			}
+		}
+		if err := f.repo.MarkDeploymentLive(ctx, d.ID, "image:tag",
+			"http://example.localhost", fmt.Sprintf("http://localhost:%d", 31000+n)); err != nil {
+			t.Fatalf("MarkDeploymentLive(%d) error = %v", n, err)
+		}
+		return d.ID
+	}
+
+	statusOf := func(t *testing.T, id string) domain.DeploymentStatus {
+		t.Helper()
+
+		got, err := f.repo.GetDeployment(ctx, f.account.ID, id)
+		if err != nil {
+			t.Fatalf("GetDeployment(%s) error = %v", id, err)
+		}
+		return got.Status
+	}
+
+	predecessor := release(t, f.service.ID, f.env.ID, 200)
+	siblingLive := release(t, sibling.ID, f.env.ID, 201)
+	previewLive := release(t, f.service.ID, preview.ID, 202)
+
+	// A build of the same service and environment that died. Failed is
+	// terminal with no legal move out of it, so widening this statement to
+	// every non-live row would relabel the one record an operator debugging
+	// that build has left.
+	dead := f.queue(t, 203)
+	if err := f.repo.TransitionDeployment(ctx, dead.ID,
+		domain.DeploymentQueued, domain.DeploymentBuilding); err != nil {
+		t.Fatalf("TransitionDeployment(queued->building) error = %v", err)
+	}
+	if err := f.repo.MarkDeploymentFailed(ctx, dead.ID, "build exited 1"); err != nil {
+		t.Fatalf("MarkDeploymentFailed() error = %v", err)
+	}
+
+	successor := release(t, f.service.ID, f.env.ID, 204)
+
+	if err := f.repo.SupersedePriorDeployments(ctx, f.service.ID, f.env.ID, successor); err != nil {
+		t.Fatalf("SupersedePriorDeployments() error = %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		id   string
+		want domain.DeploymentStatus
+	}{
+		{"the release doing the superseding stays live", successor, domain.DeploymentLive},
+		{"its predecessor is retired", predecessor, domain.DeploymentSuperseded},
+		{"a sibling service in the same environment keeps serving", siblingLive, domain.DeploymentLive},
+		{"the same service's preview keeps serving", previewLive, domain.DeploymentLive},
+		{"a failed build is not relabelled", dead.ID, domain.DeploymentFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusOf(t, tc.id); got != tc.want {
+				t.Errorf("status = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("retiring nothing is not an error", func(t *testing.T) {
+		// The same path a service's first ever release takes: the engine calls
+		// this unconditionally and treats a failure as worth warning about, so
+		// matching no rows has to be success rather than a conflict.
+		if err := f.repo.SupersedePriorDeployments(ctx, f.service.ID, f.env.ID, successor); err != nil {
+			t.Errorf("SupersedePriorDeployments() with nothing to retire = %v, want nil", err)
+		}
+		if got := statusOf(t, successor); got != domain.DeploymentLive {
+			t.Errorf("status = %q after a second call, want %q", got, domain.DeploymentLive)
+		}
+	})
+}
